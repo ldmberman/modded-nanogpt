@@ -28,6 +28,15 @@ import torch.nn.functional as F
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
+
+# CausalConv1dFn uses a custom CUDA kernel that dynamo can't trace through.
+# allow_in_graph tells dynamo to treat it as a leaf op without tracing inside.
+from causal_conv1d.causal_conv1d_interface import CausalConv1dFn
+torch._dynamo.allow_in_graph(CausalConv1dFn)
+
+def causal_conv1d_fn(x, weight, bias=None, seq_idx=None, activation=None):
+    return CausalConv1dFn.apply(x, weight, bias, seq_idx, None, None, activation == "silu")
+
 from kernels import get_kernel
 from torch import Tensor, nn
 
@@ -768,8 +777,15 @@ class DistAdam(torch.optim.Optimizer):
 
     def copy_lm_to_embed(self):
         # run at 2/3 of training
-        lm_head = self.param_groups[0]['params'][0]
-        embed = self.param_groups[-1]['params'][0]
+        lm_head = None
+        embed = None
+        for group in self.param_groups:
+            for p in group['params']:
+                if getattr(p, 'label', None) == 'lm_head':
+                    lm_head = p
+                if getattr(p, 'label', None) == 'embed':
+                    embed = p
+        assert lm_head is not None and embed is not None
         lm_head_state = self.state[lm_head]
         embed_state = self.state[embed]
         embed_state['step'] = lm_head_state['step']
@@ -919,8 +935,44 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
     key_offset: bool
+    seq_idx: torch.Tensor = None
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+
+# An implementation of the Canon layers, which were originally
+# introduced in PhysicsLM4 (https://github.com/facebookresearch/PhysicsLM4) by Zeyuan Allen-Zhu.
+class CanonLayer(nn.Module):
+    def __init__(self, dim, kernel_size=4, activation=None):
+        super().__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=kernel_size,
+            groups=dim,
+            bias=False,
+            padding=kernel_size - 1,
+        )
+        self.conv.weight.label = 'canon'
+        self.activation = activation
+
+    def forward(self, x, seq_idx=None):
+        # (batch, seq_len, dim) -> (batch, dim, seq_len)
+        x = x.transpose(1, 2)
+        x = causal_conv1d_fn(
+            x=x,
+            weight=self.conv.weight.squeeze(1),  # (dim, 1, kernel_size) -> (dim, kernel_size)
+            bias=self.conv.bias,
+            seq_idx=seq_idx,
+            activation=self.activation,
+        )
+        return x.transpose(1, 2)
+
+def apply_canon(canon, x, seq_idx=None):
+    if canon is None:
+        return x
+    return x + canon(x, seq_idx=seq_idx)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -940,6 +992,8 @@ class CausalSelfAttention(nn.Module):
         # label all modules for explicit optimizer grouping
         self.qkvo_w.label = 'attn'
 
+        self.canonB = CanonLayer(self.dim * 3)
+
         with torch.no_grad():
             self.qkvo_w[:self.dim * 3].uniform_(-bound, bound)  # init QKV weights
             self.qkvo_w[self.dim * 3:].zero_()  # init O weights to zero
@@ -955,9 +1009,11 @@ class CausalSelfAttention(nn.Module):
         # unpack attention args
         cos, sin = attn_args.cos, attn_args.sin
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
-        seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
+        seqlens, attn_scale, bm_size, seq_idx = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size, attn_args.seq_idx
 
-        q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        qkv = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x))
+        qkv = apply_canon(self.canonB, qkv, seq_idx=seq_idx)
+        q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if key_offset:
@@ -991,14 +1047,17 @@ class MLP(nn.Module):
         self.c_proj.label = 'mlp'
         self.c_proj.lr_mul = 2.
 
+        self.canonD = CanonLayer(hdim)
+
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         with torch.no_grad():
             self.c_fc.uniform_(-bound, bound)
             self.c_proj.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, seq_idx=None):
         x = F.linear(x, self.c_fc.type_as(x))
+        x = apply_canon(self.canonD, x, seq_idx=seq_idx)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.T.type_as(x))
         return x
@@ -1011,11 +1070,14 @@ class Block(nn.Module):
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim)
 
+        self.canonA = CanonLayer(dim)
+        self.canonC = CanonLayer(dim)
+
     def forward(self, x: Tensor, attn_args: AttnArgs):
         if self.attn is not None:
-            x = x + self.attn(norm(x), attn_args)
+            x = x + self.attn(apply_canon(self.canonA, norm(x), seq_idx=attn_args.seq_idx), attn_args)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x))
+            x = x + self.mlp(apply_canon(self.canonC, norm(x), seq_idx=attn_args.seq_idx), seq_idx=attn_args.seq_idx)
         return x
 
 # -----------------------------------------------------------------------------
@@ -1118,6 +1180,12 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
 
+        # generate seq_idx for canon layers to prevent cross-sequence leakage
+        T = input_seq.size(0)
+        is_boundary = torch.zeros(T + 1, dtype=torch.int32, device=input_seq.device)
+        is_boundary.scatter_(0, seqlens.long(), 1)
+        seq_idx = (torch.cumsum(is_boundary, dim=0) - 1)[:T].to(torch.int32).unsqueeze(0).contiguous()  # (1, T)
+
         # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
         if self.split_embed:
             x = self.embed(input_seq)
@@ -1143,7 +1211,8 @@ class GPT(nn.Module):
                 cos=self.yarn.cos,
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale,
-                key_offset = key_offset[i]
+                key_offset = key_offset[i],
+                seq_idx = seq_idx
             )
             if i in skip_out:
                 gate = torch.sigmoid(skip_lambda)  # in (0, 1)
@@ -1437,7 +1506,7 @@ class TrainingManager():
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
 
-        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'x0_lambdas', 'embed']
+        adam_labels = ['lm_head', 'value_embed', 'smear_gate', 'x0_lambdas', 'embed', 'canon']
         scalar_labels = ['scalars']
         muon_labels = ['attn_gate', 'attn', 'mlp']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
@@ -1652,7 +1721,7 @@ model: nn.Module = GPT(
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
 for m in model.modules():
-    if isinstance(m, (nn.Embedding, nn.Linear)):
+    if isinstance(m, (nn.Embedding, nn.Linear, nn.Conv1d)):
         m.weight.data = m.weight.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
@@ -1738,7 +1807,7 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
