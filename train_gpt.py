@@ -1577,10 +1577,13 @@ class TrainingManager():
         self.ws_short, new_ws_long = get_ws(step)
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
+            self.start_transition()
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
             self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
+            self.batch_size = new_batch_size
+            self.start_transition()
         else:
             self.train_loader_send_args = None
 
