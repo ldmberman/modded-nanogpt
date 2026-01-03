@@ -24,18 +24,9 @@ torch.empty(
 import torch._dynamo as dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
-
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
-
-# CausalConv1dFn uses a custom CUDA kernel that dynamo can't trace through.
-# allow_in_graph tells dynamo to treat it as a leaf op without tracing inside.
-from causal_conv1d.causal_conv1d_interface import CausalConv1dFn
-torch._dynamo.allow_in_graph(CausalConv1dFn)
-
-def causal_conv1d_fn(x, weight, bias=None, seq_idx=None, activation=None):
-    return CausalConv1dFn.apply(x, weight, bias, seq_idx, None, None, activation == "silu")
 
 from kernels import get_kernel
 from torch import Tensor, nn
@@ -939,40 +930,218 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# -----------------------------------------------------------------------------
+# Triton Kernels for CanonLayer (Fused 1D Causal Convolution)
+# -----------------------------------------------------------------------------
+
+@triton.jit
+def _canon_streaming_fwd_kernel(
+    x_ptr, w_ptr, sid_ptr, out_ptr,
+    stride_xb, stride_xt, stride_xd,
+    stride_ob, stride_ot, stride_od,
+    stride_sb, stride_st,
+    T, D,
+    BLOCK_D: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offsets_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offsets_d < D
+
+    # Load weights into registers: (BLOCK_D, 4)
+    w_ptr_base = w_ptr + offsets_d * 4
+    w0 = tl.load(w_ptr_base + 0, mask=mask_d).to(tl.float32)
+    w1 = tl.load(w_ptr_base + 1, mask=mask_d).to(tl.float32)
+    w2 = tl.load(w_ptr_base + 2, mask=mask_d).to(tl.float32)
+    w3 = tl.load(w_ptr_base + 3, mask=mask_d).to(tl.float32)
+
+    # Base pointers
+    x_base = x_ptr + pid_b * stride_xb + offsets_d * stride_xd
+    out_base = out_ptr + pid_b * stride_ob + offsets_d * stride_od
+    sid_base = sid_ptr + pid_b * stride_sb
+
+    # Delay line registers
+    r1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    r2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    r3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    prev_sid = -1
+
+    for t in range(T):
+        curr_x = tl.load(x_base + t * stride_xt, mask=mask_d).to(tl.float32)
+        curr_sid = tl.load(sid_base + t * stride_st)
+
+        # Reset registers on sequence boundary
+        if curr_sid != prev_sid:
+            r1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+            r2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+            r3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        res = curr_x * w0 + r1 * w1 + r2 * w2 + r3 * w3
+        tl.store(out_base + t * stride_ot, res.to(out_ptr.dtype.element_ty), mask=mask_d)
+
+        # Shift
+        r3 = r2
+        r2 = r1
+        r1 = curr_x
+        prev_sid = curr_sid
+
+@triton.jit
+def _canon_streaming_bwd_kernel(
+    x_ptr, w_ptr, sid_ptr, dout_ptr,
+    dx_ptr, dw_ptr,
+    stride_xb, stride_xt, stride_xd,
+    stride_ob, stride_ot, stride_od,
+    stride_sb, stride_st,
+    T, D,
+    BLOCK_D: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offsets_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offsets_d < D
+
+    # Load weights
+    w_ptr_base = w_ptr + offsets_d * 4
+    w0 = tl.load(w_ptr_base + 0, mask=mask_d).to(tl.float32)
+    w1 = tl.load(w_ptr_base + 1, mask=mask_d).to(tl.float32)
+    w2 = tl.load(w_ptr_base + 2, mask=mask_d).to(tl.float32)
+    w3 = tl.load(w_ptr_base + 3, mask=mask_d).to(tl.float32)
+
+    # Pointers
+    x_base = x_ptr + pid_b * stride_xb + offsets_d * stride_xd
+    dout_base = dout_ptr + pid_b * stride_ob + offsets_d * stride_od
+    dx_base = dx_ptr + pid_b * stride_ob + offsets_d * stride_od
+    sid_base = sid_ptr + pid_b * stride_sb
+
+    # dW accumulators in registers
+    dw0_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    dw1_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    dw2_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    dw3_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    # Pass 1: Streaming Backward for dX (Reverse Time)
+    f1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    f2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    f3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    next_sid = -1
+
+    for t in range(T - 1, -1, -1):
+        curr_dout = tl.load(dout_base + t * stride_ot, mask=mask_d).to(tl.float32)
+        curr_sid = tl.load(sid_base + t * stride_st)
+
+        if curr_sid != next_sid:
+            f1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+            f2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+            f3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        res_dx = curr_dout * w0 + f1 * w1 + f2 * w2 + f3 * w3
+        tl.store(dx_base + t * stride_ot, res_dx.to(dx_ptr.dtype.element_ty), mask=mask_d)
+
+        f3 = f2
+        f2 = f1
+        f1 = curr_dout
+        next_sid = curr_sid
+
+    # Pass 2: Streaming Forward for dW (Forward Time)
+    r1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    r2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    r3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    prev_sid = -1
+
+    for t in range(T):
+        curr_x = tl.load(x_base + t * stride_xt, mask=mask_d).to(tl.float32)
+        curr_dout = tl.load(dout_base + t * stride_ot, mask=mask_d).to(tl.float32)
+        curr_sid = tl.load(sid_base + t * stride_st)
+
+        if curr_sid != prev_sid:
+            r1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+            r2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+            r3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        dw0_acc += curr_dout * curr_x
+        dw1_acc += curr_dout * r1
+        dw2_acc += curr_dout * r2
+        dw3_acc += curr_dout * r3
+
+        r3 = r2
+        r2 = r1
+        r1 = curr_x
+        prev_sid = curr_sid
+
+    tl.atomic_add(dw_ptr + (offsets_d * 4 + 0), dw0_acc, mask=mask_d)
+    tl.atomic_add(dw_ptr + (offsets_d * 4 + 1), dw1_acc, mask=mask_d)
+    tl.atomic_add(dw_ptr + (offsets_d * 4 + 2), dw2_acc, mask=mask_d)
+    tl.atomic_add(dw_ptr + (offsets_d * 4 + 3), dw3_acc, mask=mask_d)
+
+# Fused Streaming Canon kernels (Forward & Backward)
+# Inspired by Manifold-Constrained Hyper-Connections (mHC, arXiv:2512.24880)
+# and PhysicsLM4. Uses registers as a delay-line to achieve 1x memory IO.
+class TritonCanonFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, seq_idx):
+        B, T, D = x.shape
+        out = torch.empty_like(x)
+        grid = (B, triton.cdiv(D, 64))
+        _canon_streaming_fwd_kernel[grid](
+            x, weight, seq_idx, out,
+            x.stride(0), x.stride(1), x.stride(2),
+            out.stride(0), out.stride(1), out.stride(2),
+            seq_idx.stride(0), seq_idx.stride(1),
+            T, D, BLOCK_D=64
+        )
+        ctx.save_for_backward(x, weight, seq_idx)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, seq_idx = ctx.saved_tensors
+        B, T, D = x.shape
+        grad_output = grad_output.contiguous()
+
+        dx = torch.empty_like(grad_output)
+        dw = torch.zeros_like(weight, dtype=torch.float32)
+
+        grid = (B, triton.cdiv(D, 64))
+        _canon_streaming_bwd_kernel[grid](
+            x, weight, seq_idx, grad_output,
+            dx, dw,
+            x.stride(0), x.stride(1), x.stride(2),
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
+            seq_idx.stride(0), seq_idx.stride(1),
+            T, D, BLOCK_D=64
+        )
+
+        return dx, dw.to(weight.dtype), None
+
+@torch.compile
+def triton_causal_conv1d(x, weight, seq_idx):
+    return TritonCanonFunction.apply(x, weight, seq_idx)
+
 # An implementation of the Canon layers, which were originally
 # introduced in PhysicsLM4 (https://github.com/facebookresearch/PhysicsLM4) by Zeyuan Allen-Zhu.
 class CanonLayer(nn.Module):
-    def __init__(self, dim, kernel_size=4, activation=None):
+    def __init__(self, dim, kernel_size=4):
         super().__init__()
         self.dim = dim
         self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=kernel_size,
-            groups=dim,
-            bias=False,
-            padding=kernel_size - 1,
-        )
-        self.conv.weight.label = 'canon'
-        self.activation = activation
+        # One filter per channel (Depthwise)
+        self.weight = nn.Parameter(torch.empty(dim, kernel_size))
+        self.weight.label = 'canon'
+        self.weight.lr_mul = 0.5
+        # Initialize as Identity mixer (Starts exactly at baseline)
+        with torch.no_grad():
+            self.weight.zero_()
+            self.weight[:, 0] = 1.0
 
     def forward(self, x, seq_idx=None):
-        # (batch, seq_len, dim) -> (batch, dim, seq_len)
-        x = x.transpose(1, 2)
-        x = causal_conv1d_fn(
-            x=x,
-            weight=self.conv.weight.squeeze(1),  # (dim, 1, kernel_size) -> (dim, kernel_size)
-            bias=self.conv.bias,
-            seq_idx=seq_idx,
-            activation=self.activation,
-        )
-        return x.transpose(1, 2)
+        return triton_causal_conv1d(x, self.weight, seq_idx)
 
 def apply_canon(canon, x, seq_idx=None):
     if canon is None:
         return x
-    return x + canon(x, seq_idx=seq_idx)
+    return canon(x, seq_idx=seq_idx)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -1012,7 +1181,7 @@ class CausalSelfAttention(nn.Module):
         seqlens, attn_scale, bm_size, seq_idx = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size, attn_args.seq_idx
 
         qkv = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x))
-        qkv = apply_canon(self.canonB, qkv, seq_idx=seq_idx)
+        qkv = self.canonB(qkv, seq_idx=seq_idx)
         q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
@@ -1057,7 +1226,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor, seq_idx=None):
         x = F.linear(x, self.c_fc.type_as(x))
-        x = apply_canon(self.canonD, x, seq_idx=seq_idx)
+        x = self.canonD(x, seq_idx=seq_idx)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.T.type_as(x))
         return x
