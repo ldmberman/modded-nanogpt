@@ -1133,6 +1133,7 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
+    step: torch.Tensor
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1232,6 +1233,9 @@ class GPT(nn.Module):
         self.bigram_embed.weight.label = 'bigram_embed'
         nn.init.zeros_(self.bigram_embed.weight)
 
+        self.cwl_sigma = nn.Parameter(torch.zeros(1))
+        self.cwl_sigma.label = 'cwl_sigma'
+
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.x0_lambdas.label = 'x0_lambdas'
@@ -1258,6 +1262,7 @@ class GPT(nn.Module):
         # unpack schedule_cfg
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+        step = schedule_cfg.step
 
         # set configs
         skip_connections = []
@@ -1344,17 +1349,55 @@ class GPT(nn.Module):
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
+
+        # Single scalar sigma for heteroscedastic CE/embedding loss blend
+        s = self.cwl_sigma
+        w_mod = torch.exp(-s)
+        alpha = (1.0 - w_mod).clamp(0.0, 1.0)
+        cwl_stats = torch.stack([s.squeeze(), w_mod.squeeze()])
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
-            loss = losses.sum()
+            ce_losses = FusedSoftcappedCrossEntropy.apply(
+                x.view(-1, x.size(-1)),
+                target_seq,
+                mtp_weights,
+                self.lm_head.weight,
+                self.lm_head.x_s,
+                self.lm_head.w_s,
+                self.lm_head.grad_s,
+                *soft_capping_params,
+            )
+
+            # Embedding similarity loss: compare hidden state direction with target embedding direction.
+            # For uncertain tokens, this provides a softer semantic signal ("move toward animal nouns")
+            # rather than the harsh categorical signal of CE ("predict exactly 'dog', reject 'cat'").
+            # Uses lm_head output space (correct for next-token prediction; matches embed when tied).
+            h_flat = x.view(-1, x.size(-1))
+            n_tokens = h_flat.size(0)
+            h_norm = F.normalize(h_flat.float(), dim=-1)
+            emb_losses = torch.zeros(n_tokens, device=h_flat.device, dtype=torch.float32)
+            n_predict = mtp_weights.size(0)
+            for k in range(n_predict):
+                w_k = mtp_weights[k]
+                n_valid = n_tokens - k
+                if n_valid <= 0:
+                    continue
+                effective_w = w_k * (w_k > 0).float()
+                target_emb_k = F.embedding(target_seq[k:k + n_valid], self.lm_head.weight.T).float()
+                target_emb_k = F.normalize(target_emb_k, dim=-1)
+                cos_sim_k = (h_norm[:n_valid] * target_emb_k).sum(dim=-1)
+                emb_losses[:n_valid] = emb_losses[:n_valid] + effective_w * (1.0 - cos_sim_k)
+
+            blended_losses = (1.0 - alpha) * ce_losses + alpha * args.cwl_emb_loss_scale * emb_losses
+            loss = (blended_losses + s).sum()
+
         else:
             logits = self.lm_head(x)
-            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+            logits = softcap_logits(logits)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-        return loss
+        return loss, cwl_stats
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1558,8 +1601,16 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # semantic CWL routing
+    cwl_emb_loss_scale: float = 0.1
+
 
 args = Hyperparameters()
+soft_capping_params = (23.0, 5.0, 7.5)
+
+def softcap_logits(logits: Tensor, params=soft_capping_params) -> Tensor:
+    a, b, c = params
+    return a * torch.sigmoid((logits + b) / c)
 
 @dataclass
 class TrainingStage:
@@ -1676,6 +1727,7 @@ class TrainingManager():
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "cwl_sigma":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.5, "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1690,7 +1742,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "cwl_sigma", "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "lm_head",
             "bigram_embed",  # Medium
             "value_embed",
@@ -1734,6 +1786,7 @@ class TrainingManager():
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
             train_max_seq_len = self.train_max_seq_len
+            step = torch.tensor(self.step, device=device)
         )
 
     def _is_adam_step(self, step: int):
@@ -1746,6 +1799,7 @@ class TrainingManager():
     def advance_schedule(self, step: int):
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
+        self.step = step
         if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
             self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
@@ -1791,6 +1845,7 @@ class TrainingManager():
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
+        self.step = 0
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -1912,9 +1967,9 @@ for step in warmup_steps:
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        loss, _ = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         training_manager.sparse_index_share(step)
-        loss.backward()
+        (loss * grad_scale).backward()
         del loss
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
@@ -1941,7 +1996,7 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if (step in (1530, 1535, 1540, 1545, 1550)) or (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
@@ -1955,11 +2010,20 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                val_step_loss, _ = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                val_loss += val_step_loss
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        cwl_s = model.cwl_sigma.item()
+        cwl_w = math.exp(-cwl_s)
+        cwl_alpha = max(0.0, 1.0 - cwl_w)
+        print0(
+            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} "
+            f"cwl_sigma:{cwl_s:.4f} w_mod:{cwl_w:.4f} alpha:{cwl_alpha:.4f} "
+            f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms",
+            console=True
+        )
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1977,9 +2041,9 @@ for step in range(train_steps + 1):
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+        loss, _ = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         training_manager.sparse_index_share(step)
-        loss.backward()
+        (loss * grad_scale).backward()
         del loss
     training_manager.step_optimizers(step)
 
