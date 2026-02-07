@@ -369,16 +369,25 @@ class NorMuonAndAdam:
             shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
             lr_mul = shape_mult * lr_mul
 
-            # Per-matrix LR multipliers for MLP c_proj (2x LR on odd indices)
+            # Per-matrix LR multipliers
             per_matrix_lr_mul = None
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            start_idx = rank * chunk_size
             if label == "mlp":
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                start_idx = rank * chunk_size
+                # MLP: c_proj gets 2x LR (odd indices in paired c_fc/c_proj layout)
                 per_matrix_lr_mul = []
                 for i in range(chunk_size):
                     global_idx = start_idx + i
                     is_c_proj = (global_idx % 2 == 1)
                     per_matrix_lr_mul.append(2.0 if is_c_proj else 1.0)
+            elif label == "attn":
+                # Attn: V and O projections get 2x LR (indices 2,3 in each Q,K,V,O group)
+                # EM-motivated: values (M-step) learn faster than queries/keys (E-step)
+                per_matrix_lr_mul = []
+                for i in range(chunk_size):
+                    global_idx = start_idx + i
+                    is_value_or_output = (global_idx % 4 >= 2)
+                    per_matrix_lr_mul.append(2.0 if is_value_or_output else 1.0)
 
             p_cfg = ParamConfig(
                 label=label,
