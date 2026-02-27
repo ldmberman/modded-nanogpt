@@ -1200,6 +1200,21 @@ class GPT(nn.Module):
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
+        # Concept-level compressed attention (inserted after layers 5 and 6)
+        self.concept_pool_k = 3
+        self.concept_layers = (5, 6)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        # QKV+O weights: (8, hdim, hdim) padded for normuon 8-GPU sharding
+        # Matrices 0-2: Q,K,V projections; Matrix 3: output projection; 4-7: padding
+        self.concept_qkvo = nn.Parameter(torch.empty(8, hdim, hdim))
+        self.concept_qkvo.reshape = (8, hdim, hdim)
+        with torch.no_grad():
+            self.concept_qkvo[:3].uniform_(-bound, bound)
+            self.concept_qkvo[3:].zero_()
+        self.concept_gate = nn.Parameter(torch.tensor([-1.0]))
+        self.concept_yarn = Yarn(head_dim, max(1, max_seq_len // self.concept_pool_k))
+
         # Attention modules (no learned params -- weights come from attn_bank)
         self.paired_head_layers = [0, 2, 5, 9]
         self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
@@ -1247,12 +1262,58 @@ class GPT(nn.Module):
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
 
+    def _pool_to_concepts(self, x: Tensor, seqlens: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        k_pool = self.concept_pool_k
+        T_seq, D = x.shape
+        total_slots = max(1, T_seq // k_pool)
+        doc_len = seqlens[1:] - seqlens[:-1]
+        n_concepts_per_doc = doc_len // k_pool
+        n_slots_per_doc = n_concepts_per_doc.clone()
+        n_slots_per_doc[-1] = n_slots_per_doc[-1] + (total_slots - n_concepts_per_doc.sum())
+        cu_concepts = torch.cat([torch.zeros(1, device=seqlens.device, dtype=torch.long), n_slots_per_doc.cumsum(0)])
+        token_idx = torch.arange(T_seq, device=x.device, dtype=torch.long)
+        doc_id = torch.searchsorted(seqlens[1:], token_idx.to(seqlens.dtype), right=True)
+        doc_start = seqlens[doc_id]
+        rel_pos = token_idx - doc_start
+        chunk_idx = rel_pos // k_pool
+        in_complete_chunk = chunk_idx < n_concepts_per_doc[doc_id]
+        segment_ids = cu_concepts[doc_id] + chunk_idx
+        concepts = x.new_zeros((total_slots, D))
+        scatter_ids = segment_ids[in_complete_chunk].clamp_(0, total_slots - 1)
+        concepts.scatter_reduce_(0, scatter_ids.unsqueeze(1).expand(-1, D), x[in_complete_chunk], reduce="mean", include_self=False)
+        prev_chunk_idx = chunk_idx - 1
+        prev_segment_ids = (cu_concepts[doc_id] + prev_chunk_idx).clamp_(0, total_slots - 1)
+        has_prev_concept = prev_chunk_idx >= 0
+        return norm(concepts.unsqueeze(0)).squeeze(0), prev_segment_ids, has_prev_concept, cu_concepts.to(seqlens.dtype)
+
+    def _concept_attention(self, x: Tensor, seqlens: Tensor, concept_qkv_w: Tensor, concept_o_w: Tensor, concept_max_len: int) -> Tensor:
+        concepts, prev_segment_ids, has_prev_concept, cu_concepts = self._pool_to_concepts(x[0], seqlens)
+        total_concepts = concepts.size(0)
+        qkv_c = F.linear(concepts, concept_qkv_w.type_as(concepts))
+        q_c, k_c, v_c = qkv_c.view(total_concepts, 3, self.num_heads, self.head_dim).unbind(1)
+        q_c = self.concept_yarn.rotary(norm(q_c.unsqueeze(0))).squeeze(0)
+        k_c = self.concept_yarn.rotary(norm(k_c.unsqueeze(0))).squeeze(0)
+        y_c = flash_attn_interface.flash_attn_varlen_func(
+            q_c, k_c, v_c,
+            cu_seqlens_q=cu_concepts, cu_seqlens_k=cu_concepts,
+            max_seqlen_q=concept_max_len, max_seqlen_k=concept_max_len,
+            causal=True, softmax_scale=self.concept_yarn.attn_scale,
+        )
+        y_c = y_c.reshape(total_concepts, self.num_heads * self.head_dim)
+        y_c = F.linear(y_c, concept_o_w.type_as(y_c)).type_as(x)
+        concept_gate = torch.sigmoid(self.concept_gate).type_as(x)
+        concept_update = x.new_zeros(x.shape)
+        concept_update[:, has_prev_concept] = y_c[prev_segment_ids[has_prev_concept]].unsqueeze(0)
+        return x + concept_gate * concept_update
+
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+        max_seq_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        concept_max_len = max(1, max_seq_len // self.concept_pool_k)
 
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1280,6 +1341,8 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        concept_qkv_w = self.concept_qkvo[:3].reshape(3 * self.num_heads * self.head_dim, self.num_heads * self.head_dim)
+        concept_o_w = self.concept_qkvo[3]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1341,6 +1404,9 @@ class GPT(nn.Module):
                 skip_connection = x
             if i == 7:
                 x_backout = x
+
+            if i in self.concept_layers:
+                x = self._concept_attention(x, seqlens, concept_qkv_w, concept_o_w, concept_max_len)
 
         # back out contributions from first 7 layers
         x -= backout_lambda * x_backout
@@ -1678,9 +1744,11 @@ class TrainingManager():
         self.param_table = {
             "attn_bank":      {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "concept_qkvo":   {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
+            "concept_gate":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.1,  "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
@@ -1696,10 +1764,10 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "concept_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
+            "concept_qkvo", "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1756,6 +1824,11 @@ class TrainingManager():
 
         new_batch_size = stage.batch_size
         new_train_max_seq_len = stage.train_max_seq_len
+        if new_train_max_seq_len != self.train_max_seq_len:
+            old_concept_len = max(1, self.train_max_seq_len // self.model.concept_pool_k)
+            new_concept_len = max(1, new_train_max_seq_len // self.model.concept_pool_k)
+            if new_concept_len != old_concept_len:
+                self.model.concept_yarn.apply(old_concept_len, new_concept_len)
         if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
             self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
             self.batch_size = new_batch_size
@@ -1797,6 +1870,7 @@ class TrainingManager():
         self.train_max_seq_len = stage.train_max_seq_len
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
+        self.model.concept_yarn.reset()
         if _sparse_comms_active():
             self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
             self.sparse_counts_state = None
@@ -1884,6 +1958,7 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.concept_qkvo.data = model.concept_qkvo.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
