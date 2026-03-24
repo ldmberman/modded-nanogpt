@@ -1230,9 +1230,10 @@ class GPT(nn.Module):
         # Per-layer bigram injection coefficients
         self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
 
-        # Block AttnRes: pseudo-query projections for depth attention
-        # [num_layers * 2, model_dim] — interleaved (attn_0, mlp_0, attn_1, mlp_1, ...)
-        self.attn_res_projs = nn.Parameter(torch.zeros(num_layers * 2, model_dim))
+        # Block AttnRes: pseudo-query projections for inter-block mixing only
+        self.block_size = 3
+        num_boundaries = num_layers // self.block_size  # mixing points between blocks
+        self.attn_res_projs = nn.Parameter(torch.zeros(num_boundaries, model_dim))
 
         pad = (-num_layers * 2 - 1) % dist.get_world_size()
         self.scalars = nn.Parameter(
@@ -1266,10 +1267,7 @@ class GPT(nn.Module):
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
-        # Block AttnRes projections: interleaved (attn_0, mlp_0, attn_1, mlp_1, ...)
-        ar_all = self.attn_res_projs.bfloat16().unbind(0)
-        ar_attn = ar_all[0::2]
-        ar_mlp  = ar_all[1::2]
+        ar_projs = self.attn_res_projs.bfloat16().unbind(0)
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
@@ -1295,22 +1293,23 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = norm(x[None])
 
-        # ---- Block AttnRes transformer layers ----
-        # blocks stores completed block representations; partial accumulates within current block
-        # block_size=4 sublayers (2 transformer layers per block), boundary every 2 layers
+        # ---- Block AttnRes transformer layers (inter-block mixing only) ----
+        # block_attn_res fires only at block boundaries; within blocks, standard residual
+        block_size = self.block_size
         blocks = [x]
-        partial = None
+        base = x
+        partial = torch.zeros_like(x)
+        boundary_idx = 0
         for i in range(self.num_layers):
-            # Block boundary: finalize current block, start new one
-            if i > 0 and i % 2 == 0:
+            if i > 0 and i % block_size == 0:
                 blocks.append(partial)
-                partial = None
+                base = block_attn_res(blocks, ar_projs[boundary_idx])
+                boundary_idx += 1
+                partial = torch.zeros_like(base)
 
-            # Bigram injection into partial
-            bigram_inject = x0_bigram * bigram_lambdas[i]
-            partial = partial + bigram_inject if partial is not None else bigram_inject
+            partial = partial + x0_bigram * bigram_lambdas[i]
+            h = base + partial
 
-            # Attention sublayer (layer 6 has no attention)
             if i != 6:
                 yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
                 attn_args = AttnArgs(
@@ -1321,17 +1320,15 @@ class GPT(nn.Module):
                 )
                 qkvo_w = attn_weights[i - (i > 6)]
                 attn_fn = self.attn_paired if i in self.paired_head_layers else self.attn
-                h = block_attn_res(blocks + [partial], ar_attn[i])
                 attn_out = attn_fn(norm(h), attn_args, qkvo_w)
                 partial = partial + post_lambdas_attn[i] * attn_out
+                h = base + partial
 
-            # MLP sublayer
-            h = block_attn_res(blocks + [partial], ar_mlp[i])
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
             partial = partial + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(h), c_fc, c_proj)
 
-        x = norm(partial)
+        x = norm(base + partial)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
