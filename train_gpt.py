@@ -945,6 +945,13 @@ class NorMuonAndAdam:
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+def block_attn_res(pool: list[Tensor], proj_weight: Tensor) -> Tensor:
+    V = torch.stack(pool)
+    K = F.rms_norm(V, (V.size(-1),))
+    logits = torch.einsum('d, n b t d -> n b t', proj_weight, K)
+    h = torch.einsum('n b t, n b t d -> b t d', logits.softmax(0), V)
+    return h
+
 
 class CastedLinearT(nn.Module):
     """
@@ -1156,9 +1163,6 @@ class GPT(nn.Module):
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
 
-        self.skip_gate = nn.Linear(12, 1, bias=False)
-        nn.init.zeros_(self.skip_gate.weight)
-
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         # spherical gaussian init by @photomz
@@ -1223,22 +1227,19 @@ class GPT(nn.Module):
 
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
 
-        # Per-layer injection coefficients for x0 and bigram
-        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
+        # Per-layer bigram injection coefficients
         self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
 
-        # Per-sublayer residual scaling: [num_layers, 2] where [:,0]=attn, [:,1]=mlp
-        # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
-        self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
+        # Block AttnRes: pseudo-query projections for depth attention
+        # [num_layers * 2, model_dim] — interleaved (attn_0, mlp_0, attn_1, mlp_1, ...)
+        self.attn_res_projs = nn.Parameter(torch.zeros(num_layers * 2, model_dim))
 
-        pad = (-num_layers * 2 - 3) % dist.get_world_size()
+        pad = (-num_layers * 2 - 1) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     torch.zeros(1), # smear_lambda
-                    0.5*torch.ones(1), # backout_lambda
-                    -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
                     torch.ones(pad),
                 ]
             )
@@ -1262,14 +1263,13 @@ class GPT(nn.Module):
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
-        backout_lambda = self.scalars[2 * self.num_layers + 1]
-        skip_lambda = self.scalars[2 * self.num_layers + 2]
-        resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
-        resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
-        x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
+        # Block AttnRes projections: interleaved (attn_0, mlp_0, attn_1, mlp_1, ...)
+        ar_all = self.attn_res_projs.bfloat16().unbind(0)
+        ar_attn = ar_all[0::2]
+        ar_mlp  = ar_all[1::2]
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
@@ -1282,69 +1282,56 @@ class GPT(nn.Module):
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
 
         # ---- Embeddings and input preparation ----
-        x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
-        
+        x = self.embed(input_seq)
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
-        # Value embeddings - always computed (not precomputed)
+        # Value embeddings
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
-        # Shifted .01 ... 234 structure on token value embeddings by @photomz
         ve = [None, ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
-        # smear token embed forward 1 position @classiclarryd
+        # smear token embed forward 1 position
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-        x = x0 = norm(x[None])
+        x = norm(x[None])
 
-        # Initialize residual stream with pre-layer-0 bigram injection
-        x = x + x0_bigram * bigram_lambdas[0]
-
-        # Precompute x0/bigram injection (added to attention output each layer)
-        # Layer 0: bigram already injected above, so only x0 component
-        x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
-        skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-        
-        # ---- Transformer layers ----
-        x_backout = None
-        skip_connection = None
+        # ---- Block AttnRes transformer layers ----
+        # blocks stores completed block representations; partial accumulates within current block
+        # block_size=4 sublayers (2 transformer layers per block), boundary every 2 layers
+        blocks = [x]
+        partial = None
         for i in range(self.num_layers):
-            yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
-            attn_args = AttnArgs(
-                ve=ve[i],
-                sa_lambdas=sa_lambdas[i],
-                seqlens=seqlens,
-                bm_size=bm_sizes[i],
-                yarn=yarn,
-                key_offset=key_offset[i],
-                attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
-            )
-            # Select weights from banks
-            qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
+            # Block boundary: finalize current block, start new one
+            if i > 0 and i % 2 == 0:
+                blocks.append(partial)
+                partial = None
+
+            # Bigram injection into partial
+            bigram_inject = x0_bigram * bigram_lambdas[i]
+            partial = partial + bigram_inject if partial is not None else bigram_inject
+
+            # Attention sublayer (layer 6 has no attention)
+            if i != 6:
+                yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
+                attn_args = AttnArgs(
+                    ve=ve[i], sa_lambdas=sa_lambdas[i], seqlens=seqlens,
+                    bm_size=bm_sizes[i], yarn=yarn, key_offset=key_offset[i],
+                    attn_gate_w=attn_gates[i], ve_gate_w=ve_gates[i],
+                    train_max_seq_len=train_max_seq_len
+                )
+                qkvo_w = attn_weights[i - (i > 6)]
+                attn_fn = self.attn_paired if i in self.paired_head_layers else self.attn
+                h = block_attn_res(blocks + [partial], ar_attn[i])
+                attn_out = attn_fn(norm(h), attn_args, qkvo_w)
+                partial = partial + post_lambdas_attn[i] * attn_out
+
+            # MLP sublayer
+            h = block_attn_res(blocks + [partial], ar_mlp[i])
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
+            partial = partial + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(h), c_fc, c_proj)
 
-            # Select attention variant for this layer
-            attn = self.attn_paired if i in self.paired_head_layers else self.attn
-
-            # Skip attention on layer 6 @YouJiacheng. Instead pull skip connection from prior long window
-            if i == 6:
-                x = x + skip_gate_out * skip_connection
-            else:
-                attn_in = x_backout if x_backout is not None else x
-                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
-                x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
-            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
-            if i == 3:
-                skip_connection = x
-            if i == 7:
-                x_backout = x
-
-        # back out contributions from first 7 layers
-        x -= backout_lambda * x_backout
-        x = norm(x)
+        x = norm(partial)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
@@ -1680,15 +1667,13 @@ class TrainingManager():
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
-            "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "x0_lambdas":     {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
-            "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "attn_res_projs": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1696,7 +1681,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "bigram_lambdas", "attn_res_projs",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
