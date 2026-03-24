@@ -1230,6 +1230,9 @@ class GPT(nn.Module):
         # Per-layer bigram injection coefficients
         self.bigram_lambdas = nn.Parameter(0.05 * torch.ones(num_layers))
 
+        # Within-block residual decay: gates the running partial sum at each layer
+        self.within_block_lambdas = nn.Parameter(torch.ones(num_layers))
+
         # Block AttnRes: pseudo-query projections for inter-block mixing only
         self.block_size = 3
         num_boundaries = num_layers // self.block_size  # mixing points between blocks
@@ -1267,6 +1270,7 @@ class GPT(nn.Module):
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
+        wb_lambdas = self.within_block_lambdas.bfloat16().unbind(0)
         ar_projs = self.attn_res_projs.bfloat16().unbind(0)
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
@@ -1307,7 +1311,7 @@ class GPT(nn.Module):
                 boundary_idx += 1
                 partial = torch.zeros_like(base)
 
-            partial = partial + x0_bigram * bigram_lambdas[i]
+            partial = wb_lambdas[i] * partial + x0_bigram * bigram_lambdas[i]
             h = base + partial
 
             if i != 6:
@@ -1671,6 +1675,7 @@ class TrainingManager():
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "bigram_lambdas": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "attn_res_projs": {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "within_block_lambdas": {"optim": "adam", "comms": "replicated",   "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1678,7 +1683,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "bigram_lambdas", "attn_res_projs",  # Small, fast
+            "scalars", "smear_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "bigram_lambdas", "attn_res_projs", "within_block_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
