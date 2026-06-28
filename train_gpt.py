@@ -1149,6 +1149,15 @@ class ForwardScheduleConfig:
     train_max_seq_len: int
 
 class GPT(nn.Module):
+    # Track 5 circuit-discovery instrumentation. Off by default.
+    # The class-level constant makes Dynamo exclude it from the training graph.
+    _cd_enabled = False
+
+    def _cd_tap(self, name, t):
+        if self._cd_enabled:
+            return self._cd.tap(name, t)
+        return t
+
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
         self.num_layers = num_layers
@@ -1416,6 +1425,7 @@ class GPT(nn.Module):
 
         # cache[k] is the layer-k snapshot used downstream by MUDD.
         # cache[0] = residual stream after bigram injection (input to layer 0).
+        x = self._cd_tap("embed", x)  # circuit-discovery grad root (Track 5 only)
         cache = {0: x}
         for i in range(self.num_layers):
             is_paired = i in self.paired_head_layers
@@ -1429,7 +1439,7 @@ class GPT(nn.Module):
 
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
-                x = x + skip_gate_out * cache[3]
+                x = x + self._cd_tap("skip6", skip_gate_out * cache[3])
             else:
                 qkvo_w = attn_weights[i - (i > 6)]
                 attn_in_normed = norm(cache.get(7, x))
@@ -1466,6 +1476,7 @@ class GPT(nn.Module):
                     train_max_seq_len=train_max_seq_len,
                 )
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w)
+                attn_out = self._cd_tap(f"attn{i}", attn_out)
 
                 if mu is not None:
                     x = mu[8] * x + mu[9] * attn_out + mu[10] * cache[0] 
@@ -1485,10 +1496,11 @@ class GPT(nn.Module):
             else:
                 mlp_args = (c_fc, c_proj)
 
+            mlp_o = self._cd_tap(f"mlp{i}", ReLUSqrdMLP(normed, *mlp_args))
             if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(normed, *mlp_args)
+                x = mu[12] * x + mu[13] * mlp_o
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * mlp_o
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -1499,6 +1511,7 @@ class GPT(nn.Module):
         x = x + mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * cache[9] + mu[3] * ve_bank0 + mu[4] * cache[3]
 
         x = norm(x)
+        x = self._cd_tap("resid_final", x)  # circuit-discovery readout (Track 5 only)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
@@ -2066,6 +2079,64 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 model.quantize_mlp_fp8()
+
+# -------- Track 5 interpretability: capability probe on a checkpoint --------
+# Eval-only path: load a saved checkpoint, replay the YaRN window schedule
+# (rotary buffers are persistent=False so they're not in the checkpoint), run the
+# forced-choice probe, and exit WITHOUT compiling or training. The saved
+# state_dict comes from the compiled model, so strip the `_orig_mod.` prefix.
+# Enable with: TRACK5_PROBE_CKPT=<path/to/state_stepNNNNNN.pt>
+if os.environ.get("TRACK5_PROBE_CKPT"):
+    _ckpt_path = os.environ["TRACK5_PROBE_CKPT"]
+    print0(f"[track5] loading checkpoint {_ckpt_path}", console=True)
+    _ckpt = torch.load(_ckpt_path, map_location=device, weights_only=False)
+    _state = _ckpt.get("model", _ckpt)
+    _state = {k.replace("_orig_mod.", ""): v for k, v in _state.items()}
+    model.load_state_dict(_state)
+
+    # Replay 3->7->11->13 window transitions so YaRN rotary matches end-of-training.
+    _BLOCK = 128  # == TrainingManager.block_size
+    model.yarn.reset(); model.yarn_paired_head.reset()
+    _ws_long = TRAINING_STAGES[0].window_sizes[1]
+    for _stage in TRAINING_STAGES:
+        _new = _stage.window_sizes[1]
+        if _new != _ws_long:
+            model.yarn.apply(_ws_long * _BLOCK, _new * _BLOCK)
+            model.yarn_paired_head.apply(_ws_long * _BLOCK, _new * _BLOCK)
+            _ws_long = _new
+    _schedule_cfg = ForwardScheduleConfig(
+        mtp_weights=training_schedule.mtp_weights[-1],            # unused in eval
+        ws_short=TRAINING_STAGES[-1].window_sizes[0] * _BLOCK,
+        ws_long=training_schedule.ws_post_yarn_ext * _BLOCK,      # final val extension
+        train_max_seq_len=TRAINING_STAGES[-1].train_max_seq_len,
+    )
+
+    _max_len = args.val_batch_size // (grad_accum_steps * world_size)
+    _probe_seq_len = min(int(os.environ.get("TRACK5_PROBE_SEQLEN", "16384")), _max_len)
+    _n_per_task = int(os.environ.get("TRACK5_PROBE_N", "200"))
+
+    # Circuit-discovery path (needs grad, so NOT under inference_mode).
+    # Enable with TRACK5_CIRCUIT=1; pick tasks via TRACK5_CIRCUIT_TASKS=a,b,c.
+    if os.environ.get("TRACK5_CIRCUIT"):
+        from records.track_5_interpretability import circuit_patcher
+        _cd_tasks = os.environ.get("TRACK5_CIRCUIT_TASKS", "induction,ioi").split(",")
+        _n_cd = int(os.environ.get("TRACK5_CD_N", "48"))
+        _tau = float(os.environ.get("TRACK5_CD_TAU", "0.8"))
+        model.eval()
+        circuit_patcher.run(model, _schedule_cfg, get_bigram_hash, print0,
+                            tasks=_cd_tasks, n_cd=_n_cd, tau=_tau, device=str(device))
+        dist.destroy_process_group()
+        sys.exit(0)
+
+    from records.track_5_interpretability import probe_harness
+    model.eval()
+    with torch.inference_mode():
+        probe_harness.run(model, _schedule_cfg, seq_len=_probe_seq_len,
+                          get_bigram_hash=get_bigram_hash, print0=print0,
+                          n_per_task=_n_per_task, device=str(device))
+    dist.destroy_process_group()
+    sys.exit(0)
+# ---------------------------------------------------------------------------
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
