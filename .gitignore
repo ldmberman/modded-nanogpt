@@ -3,3 +3,7 @@ pylog124M/
 __pycache__/
 logs/
 .DS_Store
+
+# Large model checkpoints are hosted on the Hugging Face Hub, not in git.
+# Fetch with: python -m records.track_4_upscaling.utils.download_weights small_L1.pt
+records/track_4_upscaling/checkpoints/

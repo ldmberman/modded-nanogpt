@@ -1,0 +1,2 @@
+ref_version,hparams_version,kind,params_nonembed,L1,L2,steps_to_L2,tokens_to_L2,flops_to_L2,wall_seconds,reached,seed
+ref1,H1,from_scratch_large,262682304,3.25,3.18,13250,3473408000,5.30725e+18,,1,2

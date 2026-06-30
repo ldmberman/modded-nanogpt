@@ -1,0 +1,77 @@
+[W623 18:25:47.799625529 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.803193205 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.813930663 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.031059715 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.042152412 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.085193206 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.220707878 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+[W623 18:25:47.222740274 CUDAAllocatorConfig.h:28] Warning: expandable_segments not supported on this platform (function operator())
+    step    0/18000  val_loss 10.8258
+    step  250/18000  val_loss 4.6262
+    step  500/18000  val_loss 4.0216
+    step  750/18000  val_loss 3.8355
+    step 1000/18000  val_loss 3.7339
+    step 1250/18000  val_loss 3.6636
+    step 1500/18000  val_loss 3.6134
+    step 1750/18000  val_loss 3.5728
+    step 2000/18000  val_loss 3.5364
+    step 2250/18000  val_loss 3.5129
+    step 2500/18000  val_loss 3.4860
+    step 2750/18000  val_loss 3.4681
+    step 3000/18000  val_loss 3.4434
+    step 3250/18000  val_loss 3.4310
+    step 3500/18000  val_loss 3.4138
+    step 3750/18000  val_loss 3.4007
+    step 4000/18000  val_loss 3.3897
+    step 4250/18000  val_loss 3.3778
+    step 4500/18000  val_loss 3.3679
+    step 4750/18000  val_loss 3.3608
+    step 5000/18000  val_loss 3.3529
+    step 5250/18000  val_loss 3.3432
+    step 5500/18000  val_loss 3.3354
+    step 5750/18000  val_loss 3.3296
+    step 6000/18000  val_loss 3.3239
+    step 6250/18000  val_loss 3.3157
+    step 6500/18000  val_loss 3.3070
+    step 6750/18000  val_loss 3.3019
+    step 7000/18000  val_loss 3.2955
+    step 7250/18000  val_loss 3.2907
+    step 7500/18000  val_loss 3.2870
+    step 7750/18000  val_loss 3.2837
+    step 8000/18000  val_loss 3.2764
+    step 8250/18000  val_loss 3.2736
+    step 8500/18000  val_loss 3.2685
+    step 8750/18000  val_loss 3.2640
+    step 9000/18000  val_loss 3.2631
+    step 9250/18000  val_loss 3.2566
+    step 9500/18000  val_loss 3.2525
+    step 9750/18000  val_loss 3.2488
+    step 10000/18000  val_loss 3.2448
+    step 10250/18000  val_loss 3.2423
+    step 10500/18000  val_loss 3.2398
+    step 10750/18000  val_loss 3.2364
+    step 11000/18000  val_loss 3.2332
+    step 11250/18000  val_loss 3.2267
+    step 11500/18000  val_loss 3.2197
+    step 11750/18000  val_loss 3.2150
+    step 12000/18000  val_loss 3.2081
+    step 12250/18000  val_loss 3.2043
+    step 12500/18000  val_loss 3.1955
+    step 12750/18000  val_loss 3.1884
+    step 13000/18000  val_loss 3.1821
+    step 13250/18000  val_loss 3.1760
+    step 13500/18000  val_loss 3.1691
+    step 13750/18000  val_loss 3.1644
+    step 14000/18000  val_loss 3.1578
+    step 14250/18000  val_loss 3.1530
+    step 14500/18000  val_loss 3.1471
+    step 14750/18000  val_loss 3.1424
+    step 15000/18000  val_loss 3.1362
+    step 15250/18000  val_loss 3.1309
+    step 15500/18000  val_loss 3.1242
+    step 15750/18000  val_loss 3.1182
+    step 16000/18000  val_loss 3.1130
+    step 16250/18000  val_loss 3.1076
+    step 16500/18000  val_loss 3.1025
+    step 16750/18000  val_loss 3.0978
+[refs] from_scratch_large reached=True steps=16750 flops=6.709e+18
