@@ -1200,6 +1200,8 @@ def build_prefix_table(vocab_size: int) -> Tensor:
 ENABLE_PREFIX_TOKEN_LOSS = True
 SEMANTIC_AUX_MODE = "neighbors"  # "neighbors", "clusters", or "none"
 SEMANTIC_AUX_WEIGHT = 0.1
+SEMANTIC_SNAPSHOT_FRACTION = 1/6
+SEMANTIC_DECAY_END_FRACTION = 2/3
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
 assert SEMANTIC_AUX_MODE in {"neighbors", "clusters", "none"}
@@ -1986,8 +1988,6 @@ class TrainingStage:
     train_max_seq_len: int
     prefix_weight_start: float = 0.0
     prefix_weight_end: float = 0.0
-    semantic_weight_start: float = 0.0
-    semantic_weight_end: float = 0.0
     duration: float = None
 
 class TrainingSchedule:
@@ -2000,7 +2000,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Optional semantic neighbor or cluster snapshot at 1/3, active during the second third
+        8. Optional semantic neighbor or cluster snapshot at 1/6, decayed to zero by 2/3
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2021,6 +2021,9 @@ class TrainingSchedule:
         # Split embed at specified stage (ensure odd step for Adam)
         self.split_step = self.boundaries[split_embed_stage][0] | 1
 
+        self.semantic_snapshot_step = round(SEMANTIC_SNAPSHOT_FRACTION * scheduled_iterations)
+        semantic_decay_end_step = round(SEMANTIC_DECAY_END_FRACTION * scheduled_iterations)
+
         # Precompute auxiliary loss weights for all steps
         self.mtp_weights = []
         self.prefix_weights = []
@@ -2031,7 +2034,11 @@ class TrainingSchedule:
             self.mtp_weights.append(torch.tensor(w, device=device))
             pw = stage.prefix_weight_start + (stage.prefix_weight_end - stage.prefix_weight_start) * t
             self.prefix_weights.append(torch.tensor([pw], device=device))
-            sw = stage.semantic_weight_start + (stage.semantic_weight_end - stage.semantic_weight_start) * t
+            if SEMANTIC_AUX_MODE == "none" or not self.semantic_snapshot_step <= step < semantic_decay_end_step:
+                sw = 0.0
+            else:
+                progress = (step - self.semantic_snapshot_step) / (semantic_decay_end_step - self.semantic_snapshot_step)
+                sw = SEMANTIC_AUX_WEIGHT * (1 - progress)
             self.semantic_weights.append(torch.tensor([sw], device=device))
 
     def lookup(self, step: int) -> tuple[TrainingStage, float]:
@@ -2060,9 +2067,7 @@ TRAINING_STAGES = [
                   prefix_weight_end=0.25 if ENABLE_PREFIX_TOKEN_LOSS else 0.0),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0],
-                  prefix_weight_start=0.25 if ENABLE_PREFIX_TOKEN_LOSS else 0.0,
-                  semantic_weight_start=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0,
-                  semantic_weight_end=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0),
+                  prefix_weight_start=0.25 if ENABLE_PREFIX_TOKEN_LOSS else 0.0),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
     # extension stage
@@ -2399,7 +2404,7 @@ if ENABLE_PREFIX_TOKEN_LOSS:
     model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
-semantic_snapshot_step = training_schedule.boundaries[1][0]
+semantic_snapshot_step = training_schedule.semantic_snapshot_step
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
