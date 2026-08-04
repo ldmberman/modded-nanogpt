@@ -1955,7 +1955,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Semantic neighbor snapshots at 1/3 and 2/3, with the loss faded out in the final third
+        8. Semantic neighbor snapshot at 1/3, with the loss active during the second third
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2015,8 +2015,7 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0], prefix_weight_start=0.25, prefix_weight_end=0.0,
                   semantic_weight_start=0.1, semantic_weight_end=0.1),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0,
-                  semantic_weight_start=0.1, semantic_weight_end=0.0),
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
     # extension stage
     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
@@ -2353,11 +2352,11 @@ t0 = time.perf_counter()
 model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
-semantic_snapshot_steps = {training_schedule.boundaries[1][0], training_schedule.boundaries[2][0]}
+semantic_snapshot_step = training_schedule.boundaries[1][0]
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
-    if step in semantic_snapshot_steps:
+    if step == semantic_snapshot_step:
         model.semantic_neighbor_table.copy_(
             build_semantic_neighbor_table(model.lm_head.weight, model.vocab_size)
         )
