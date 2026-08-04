@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, SEMANTIC_NEIGHBOR_K, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
 )
@@ -1197,10 +1197,29 @@ def build_prefix_table(vocab_size: int) -> Tensor:
         stack_ids.append(tid)
     return torch.tensor(table, dtype=torch.int64)
 
+@torch.no_grad()
+def build_semantic_neighbor_table(lm_head_weight: Tensor, vocab_size: int, chunk_size: int = 1024) -> Tensor:
+    valid_vocab_size = len(tiktoken.get_encoding("gpt2")._mergeable_ranks)
+    embeddings = F.normalize(lm_head_weight[:, :valid_vocab_size].T.float(), dim=1).bfloat16().contiguous()
+    table = torch.full(
+        (vocab_size, SEMANTIC_NEIGHBOR_K),
+        -1,
+        dtype=torch.int64,
+        device=lm_head_weight.device,
+    )
+    for start in range(0, valid_vocab_size, chunk_size):
+        end = min(start + chunk_size, valid_vocab_size)
+        scores = embeddings[start:end] @ embeddings.T
+        rows = torch.arange(end - start, device=lm_head_weight.device)
+        scores[rows, torch.arange(start, end, device=lm_head_weight.device)] = -torch.inf
+        table[start:end] = scores.topk(SEMANTIC_NEIGHBOR_K, dim=1).indices
+    return table
+
 @dataclass(slots=True)
 class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     prefix_weight: torch.Tensor
+    semantic_weight: torch.Tensor
     ws_short: int
     ws_long: int
     train_max_seq_len: int
@@ -1219,6 +1238,11 @@ class GPT(nn.Module):
         # after the clock starts (see "start the clock") so the build is charged to training
         # time. -1 means "no valid prefix" == term disabled, which is what warmup runs with.
         self.register_buffer("prefix_table", torch.full((self.vocab_size,), -1, dtype=torch.int64), persistent=False)
+        self.register_buffer(
+            "semantic_neighbor_table",
+            torch.full((self.vocab_size, SEMANTIC_NEIGHBOR_K), -1, dtype=torch.int64),
+            persistent=False,
+        )
 
         # Transposed weight storage for faster gradient accumulation
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1489,6 +1513,7 @@ class GPT(nn.Module):
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         prefix_weight = schedule_cfg.prefix_weight
+        semantic_weight = schedule_cfg.semantic_weight
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1684,7 +1709,8 @@ class GPT(nn.Module):
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
             prefix_target_seq = self.prefix_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            semantic_target_seq = self.semantic_neighbor_table[target_seq]
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_target_seq, semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1915,6 +1941,8 @@ class TrainingStage:
     train_max_seq_len: int
     prefix_weight_start: float = 0.0
     prefix_weight_end: float = 0.0
+    semantic_weight_start: float = 0.0
+    semantic_weight_end: float = 0.0
     duration: float = None
 
 class TrainingSchedule:
@@ -1927,6 +1955,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
+        8. Semantic neighbor snapshots at 1/3 and 2/3, with the loss faded out in the final third
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -1947,15 +1976,18 @@ class TrainingSchedule:
         # Split embed at specified stage (ensure odd step for Adam)
         self.split_step = self.boundaries[split_embed_stage][0] | 1
 
-        # Precompute MTP weights and prefix-prediction weights for all steps
+        # Precompute auxiliary loss weights for all steps
         self.mtp_weights = []
         self.prefix_weights = []
+        self.semantic_weights = []
         for step in range(self.total_steps + 1):
             stage, t = self.lookup(step)
             w = [a + (b - a) * t for a, b in zip(stage.mtp_weights_start, stage.mtp_weights_end)]
             self.mtp_weights.append(torch.tensor(w, device=device))
             pw = stage.prefix_weight_start + (stage.prefix_weight_end - stage.prefix_weight_start) * t
             self.prefix_weights.append(torch.tensor([pw], device=device))
+            sw = stage.semantic_weight_start + (stage.semantic_weight_end - stage.semantic_weight_start) * t
+            self.semantic_weights.append(torch.tensor([sw], device=device))
 
     def lookup(self, step: int) -> tuple[TrainingStage, float]:
         # Returns stage and % of the way through that stage
@@ -1980,9 +2012,11 @@ TRAINING_STAGES = [
     TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0], prefix_weight_start=0.25, prefix_weight_end=0.25),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
-                  mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0], prefix_weight_start=0.25, prefix_weight_end=0.0),
+                  mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0], prefix_weight_start=0.25, prefix_weight_end=0.0,
+                  semantic_weight_start=0.1, semantic_weight_end=0.1),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0,
+                  semantic_weight_start=0.1, semantic_weight_end=0.0),
     # extension stage
     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
@@ -2096,6 +2130,7 @@ class TrainingManager():
         return ForwardScheduleConfig(
             mtp_weights = self.mtp_weights,
             prefix_weight = self.prefix_weight,
+            semantic_weight = self.semantic_weight,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
             train_max_seq_len = self.train_max_seq_len
@@ -2127,6 +2162,7 @@ class TrainingManager():
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
         self.prefix_weight = training_schedule.prefix_weights[step]
+        self.semantic_weight = training_schedule.semantic_weights[step]
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
@@ -2317,9 +2353,14 @@ t0 = time.perf_counter()
 model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
+semantic_snapshot_steps = {training_schedule.boundaries[1][0], training_schedule.boundaries[2][0]}
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
+    if step in semantic_snapshot_steps:
+        model.semantic_neighbor_table.copy_(
+            build_semantic_neighbor_table(model.lm_head.weight, model.vocab_size)
+        )
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:

@@ -905,10 +905,12 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
+SEMANTIC_NEIGHBOR_K = 4
 
 CE_KERNEL_DECLS = f"""
 constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
 constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
+constexpr int SEMANTIC_NEIGHBOR_K = {SEMANTIC_NEIGHBOR_K};
 """
 
 CE_KERNEL_SOURCE = """
@@ -961,6 +963,8 @@ __global__ void ce_fwd_bwd_kernel(
     const float* __restrict__ mtp_weights,
     const int64_t* __restrict__ prefix_targets,
     const float* __restrict__ prefix_weight_ptr,
+    const int64_t* __restrict__ semantic_targets,
+    const float* __restrict__ semantic_weight_ptr,
     float* __restrict__ losses,
     __nv_fp8_e5m2* grad_input,
     int batch_size,
@@ -981,6 +985,8 @@ __global__ void ce_fwd_bwd_kernel(
   float grad_s = (float)grad_s_param;
   float grad_scale = (float)grad_scale_param;
   float prefix_weight = prefix_weight_ptr[0];
+  float semantic_weight = semantic_weight_ptr[0];
+  float semantic_target_weight = semantic_weight / SEMANTIC_NEIGHBOR_K;
 
   extern __shared__ __nv_bfloat16 smem[];
 
@@ -1086,6 +1092,13 @@ __global__ void ce_fwd_bwd_kernel(
       float z_target = A * __bfloat162float(smem[prefix_target]);
       total_loss += prefix_weight * (lse - z_target);
     }
+    for (int k = 0; k < SEMANTIC_NEIGHBOR_K; k++) {
+      int64_t target = semantic_targets[blockIdx.x * SEMANTIC_NEIGHBOR_K + k];
+      if (target >= 0 && target < VOCAB_SIZE) {
+        float z_target = A * __bfloat162float(smem[target]);
+        total_loss += semantic_target_weight * (lse - z_target);
+      }
+    }
     losses[blockIdx.x] = total_loss;
   }
 
@@ -1095,6 +1108,12 @@ __global__ void ce_fwd_bwd_kernel(
 
   for (int i = 0; i < n_predict; i++) {
     S_w += mtp_weights[i];
+  }
+  for (int i = 0; i < SEMANTIC_NEIGHBOR_K; i++) {
+    int64_t target = semantic_targets[blockIdx.x * SEMANTIC_NEIGHBOR_K + i];
+    if (target >= 0 && target < VOCAB_SIZE) {
+      S_w += semantic_target_weight;
+    }
   }
 
   #pragma unroll 4
@@ -1124,11 +1143,9 @@ __global__ void ce_fwd_bwd_kernel(
 
   __syncthreads();
 
-  // Sparse correction for target columns. Threads [0, n_predict) handle the future MTP
-  // targets; thread n_predict handles the prefix target. term2 for a column sums the
-  // weights of every prediction (MTP + prefix) whose target lands on that column, so
-  // duplicate columns across threads write identical values (idempotent, race-free).
-  if (threadIdx.x <= n_predict) {
+  // term2 for a column sums the weights of every prediction whose target lands on that
+  // column, so duplicate target threads write identical values.
+  if (threadIdx.x < n_predict + 1 + SEMANTIC_NEIGHBOR_K) {
     int i = threadIdx.x;
     int64_t target;
     bool valid;
@@ -1137,9 +1154,12 @@ __global__ void ce_fwd_bwd_kernel(
       valid = (target_idx < batch_size);
       target = valid ? targets[target_idx] : -1;
       valid = valid && (target >= 0 && target < VOCAB_SIZE);
-    } else {
+    } else if (i == n_predict) {
       target = prefix_target;
       valid = prefix_valid;
+    } else {
+      target = semantic_targets[blockIdx.x * SEMANTIC_NEIGHBOR_K + i - n_predict - 1];
+      valid = (target >= 0 && target < VOCAB_SIZE);
     }
 
     if (valid) {
@@ -1158,6 +1178,12 @@ __global__ void ce_fwd_bwd_kernel(
       }
       if (prefix_valid && prefix_target == target) {
         term2 += prefix_weight;
+      }
+      for (int k = 0; k < SEMANTIC_NEIGHBOR_K; k++) {
+        int64_t semantic_target = semantic_targets[blockIdx.x * SEMANTIC_NEIGHBOR_K + k];
+        if (semantic_target == target) {
+          term2 += semantic_target_weight;
+        }
       }
 
       float grad_z = term1 - term2;
@@ -1186,6 +1212,8 @@ def ce_fwd_bwd(
     mtp_weights: torch.Tensor,
     prefix_targets: torch.Tensor,
     prefix_weight: torch.Tensor,
+    semantic_targets: torch.Tensor,
+    semantic_weight: torch.Tensor,
     losses: torch.Tensor,
     grad_input: torch.Tensor,
     n_rows: int,
@@ -1200,14 +1228,15 @@ def ce_fwd_bwd(
     ce_fwd_bwd_kernel(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
-        (logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
+        (logits, targets, mtp_weights, prefix_targets, prefix_weight, semantic_targets,
+         semantic_weight, losses, grad_input,
          n_rows, n_predict, A, B, C, grad_s, grad_scale),
         shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
     )
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, prefix_targets, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, prefix_targets, prefix_weight, semantic_targets, semantic_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -1243,9 +1272,18 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             prefix_weight = torch.zeros(1, dtype=torch.float32, device=logits.device)
         prefix_weight = prefix_weight.reshape(1).to(torch.float32).contiguous()
 
+        if semantic_targets is None:
+            semantic_targets = torch.full((n_rows, SEMANTIC_NEIGHBOR_K), -1, dtype=torch.int64, device=logits.device)
+        semantic_targets = semantic_targets.contiguous()
+
+        if semantic_weight is None:
+            semantic_weight = torch.zeros(1, dtype=torch.float32, device=logits.device)
+        semantic_weight = semantic_weight.reshape(1).to(torch.float32).contiguous()
+
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
 
-        ce_fwd_bwd(logits, targets, mtp_weights, prefix_targets, prefix_weight, losses, grad_input,
+        ce_fwd_bwd(logits, targets, mtp_weights, prefix_targets, prefix_weight, semantic_targets,
+             semantic_weight, losses, grad_input,
              n_rows, n_predict, A, B, C, grad_s, grad_scale)
 
         ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
@@ -1289,4 +1327,4 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
-        return grad_x, None, None, None, None, grad_w, None, None, None
+        return grad_x, None, None, None, None, None, None, grad_w, None, None, None, None
