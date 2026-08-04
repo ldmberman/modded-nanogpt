@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, SEMANTIC_NEIGHBOR_K, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
 )
@@ -1197,8 +1197,30 @@ def build_prefix_table(vocab_size: int) -> Tensor:
         stack_ids.append(tid)
     return torch.tensor(table, dtype=torch.int64)
 
+ENABLE_PREFIX_TOKEN_LOSS = False
+SEMANTIC_AUX_MODE = "neighbors"  # "neighbors", "clusters", or "none"
+SEMANTIC_AUX_WEIGHT = 0.1
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
+assert SEMANTIC_AUX_MODE in {"neighbors", "clusters", "none"}
+
+@torch.no_grad()
+def build_semantic_neighbor_table(lm_head_weight: Tensor, vocab_size: int, chunk_size: int = 1024) -> Tensor:
+    valid_vocab_size = len(tiktoken.get_encoding("gpt2")._mergeable_ranks)
+    embeddings = F.normalize(lm_head_weight[:, :valid_vocab_size].T.float(), dim=1).bfloat16().contiguous()
+    table = torch.full(
+        (vocab_size, SEMANTIC_NEIGHBOR_K),
+        -1,
+        dtype=torch.int64,
+        device=lm_head_weight.device,
+    )
+    for start in range(0, valid_vocab_size, chunk_size):
+        end = min(start + chunk_size, valid_vocab_size)
+        scores = embeddings[start:end] @ embeddings.T
+        rows = torch.arange(end - start, device=lm_head_weight.device)
+        scores[rows, torch.arange(start, end, device=lm_head_weight.device)] = -torch.inf
+        table[start:end] = scores.topk(SEMANTIC_NEIGHBOR_K, dim=1).indices
+    return table
 
 @torch.no_grad()
 def build_semantic_cluster_table(lm_head_weight: Tensor, vocab_size: int) -> Tensor:
@@ -1256,6 +1278,11 @@ class GPT(nn.Module):
         # after the clock starts (see "start the clock") so the build is charged to training
         # time. -1 means "no valid prefix" == term disabled, which is what warmup runs with.
         self.register_buffer("prefix_table", torch.full((self.vocab_size,), -1, dtype=torch.int64), persistent=False)
+        self.register_buffer(
+            "semantic_neighbor_table",
+            torch.full((self.vocab_size, SEMANTIC_NEIGHBOR_K), -1, dtype=torch.int64),
+            persistent=False,
+        )
         self.register_buffer(
             "semantic_cluster_table",
             torch.full((self.vocab_size,), -1, dtype=torch.int64),
@@ -1727,7 +1754,8 @@ class GPT(nn.Module):
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
             prefix_target_seq = self.prefix_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.semantic_cluster_table, semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            semantic_neighbor_targets = self.semantic_neighbor_table[target_seq]
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_neighbor_targets, self.semantic_cluster_table, semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1972,7 +2000,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Semantic cluster snapshot at 1/3, with cluster-marginal loss during the second third and prefix-token loss disabled
+        8. Optional semantic neighbor or cluster snapshot at 1/3, held through the second third and faded out in the final third
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2027,12 +2055,18 @@ class TrainingSchedule:
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
     TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
-                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
+                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0],
+                  prefix_weight_start=0.25 if ENABLE_PREFIX_TOKEN_LOSS else 0.0,
+                  prefix_weight_end=0.25 if ENABLE_PREFIX_TOKEN_LOSS else 0.0),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0],
-                  semantic_weight_start=0.1, semantic_weight_end=0.1),
+                  prefix_weight_start=0.25 if ENABLE_PREFIX_TOKEN_LOSS else 0.0,
+                  semantic_weight_start=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0,
+                  semantic_weight_end=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0,
+                  semantic_weight_start=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0,
+                  semantic_weight_end=0.0),
     # extension stage
     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
@@ -2363,13 +2397,22 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+if ENABLE_PREFIX_TOKEN_LOSS:
+    model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
 semantic_snapshot_step = training_schedule.boundaries[1][0]
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
-    if step == semantic_snapshot_step:
+    if step == semantic_snapshot_step and SEMANTIC_AUX_MODE == "neighbors":
+        if master_process:
+            semantic_neighbor_table = build_semantic_neighbor_table(model.lm_head.weight, model.vocab_size)
+        else:
+            semantic_neighbor_table = torch.empty_like(model.semantic_neighbor_table)
+        dist.broadcast(semantic_neighbor_table, 0)
+        model.semantic_neighbor_table.copy_(semantic_neighbor_table)
+    elif step == semantic_snapshot_step and SEMANTIC_AUX_MODE == "clusters":
         if master_process:
             semantic_cluster_table = build_semantic_cluster_table(model.lm_head.weight, model.vocab_size)
         else:
