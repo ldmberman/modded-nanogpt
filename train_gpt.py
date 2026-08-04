@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, SEMANTIC_NEIGHBOR_K, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
 )
@@ -1197,22 +1197,40 @@ def build_prefix_table(vocab_size: int) -> Tensor:
         stack_ids.append(tid)
     return torch.tensor(table, dtype=torch.int64)
 
+SEMANTIC_CLUSTER_COUNT = 256
+SEMANTIC_KMEANS_ITERATIONS = 8
+
 @torch.no_grad()
-def build_semantic_neighbor_table(lm_head_weight: Tensor, vocab_size: int, chunk_size: int = 1024) -> Tensor:
+def build_semantic_cluster_table(lm_head_weight: Tensor, vocab_size: int) -> Tensor:
     valid_vocab_size = len(tiktoken.get_encoding("gpt2")._mergeable_ranks)
-    embeddings = F.normalize(lm_head_weight[:, :valid_vocab_size].T.float(), dim=1).bfloat16().contiguous()
-    table = torch.full(
-        (vocab_size, SEMANTIC_NEIGHBOR_K),
-        -1,
-        dtype=torch.int64,
+    embeddings = F.normalize(lm_head_weight[:, :valid_vocab_size].T.float(), dim=1)
+    embeddings_bf16 = embeddings.bfloat16().contiguous()
+
+    generator = torch.Generator(device=lm_head_weight.device)
+    generator.manual_seed(1234)
+    initial_ids = torch.randperm(
+        valid_vocab_size,
+        generator=generator,
         device=lm_head_weight.device,
-    )
-    for start in range(0, valid_vocab_size, chunk_size):
-        end = min(start + chunk_size, valid_vocab_size)
-        scores = embeddings[start:end] @ embeddings.T
-        rows = torch.arange(end - start, device=lm_head_weight.device)
-        scores[rows, torch.arange(start, end, device=lm_head_weight.device)] = -torch.inf
-        table[start:end] = scores.topk(SEMANTIC_NEIGHBOR_K, dim=1).indices
+    )[:SEMANTIC_CLUSTER_COUNT]
+    centroids = embeddings_bf16[initial_ids].contiguous()
+
+    for _ in range(SEMANTIC_KMEANS_ITERATIONS):
+        assignments = (embeddings_bf16 @ centroids.T).argmax(dim=1)
+        centroid_sums = torch.zeros(
+            (SEMANTIC_CLUSTER_COUNT, embeddings.size(1)),
+            dtype=torch.float32,
+            device=lm_head_weight.device,
+        )
+        centroid_sums.index_add_(0, assignments, embeddings)
+        nonempty = torch.bincount(assignments, minlength=SEMANTIC_CLUSTER_COUNT) > 0
+        updated_centroids = centroids.float()
+        updated_centroids[nonempty] = F.normalize(centroid_sums[nonempty], dim=1)
+        centroids = updated_centroids.bfloat16().contiguous()
+
+    assignments = (embeddings_bf16 @ centroids.T).argmax(dim=1)
+    table = torch.full((vocab_size,), -1, dtype=torch.int64, device=lm_head_weight.device)
+    table[:valid_vocab_size] = assignments
     return table
 
 @dataclass(slots=True)
@@ -1239,8 +1257,8 @@ class GPT(nn.Module):
         # time. -1 means "no valid prefix" == term disabled, which is what warmup runs with.
         self.register_buffer("prefix_table", torch.full((self.vocab_size,), -1, dtype=torch.int64), persistent=False)
         self.register_buffer(
-            "semantic_neighbor_table",
-            torch.full((self.vocab_size, SEMANTIC_NEIGHBOR_K), -1, dtype=torch.int64),
+            "semantic_cluster_table",
+            torch.full((self.vocab_size,), -1, dtype=torch.int64),
             persistent=False,
         )
 
@@ -1709,8 +1727,7 @@ class GPT(nn.Module):
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
             prefix_target_seq = self.prefix_table[target_seq]
-            semantic_target_seq = self.semantic_neighbor_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_target_seq, semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, self.semantic_cluster_table, semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1955,7 +1972,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Semantic neighbor snapshot at 1/3, with the loss active during the second third and prefix-token loss disabled
+        8. Semantic cluster snapshot at 1/3, with cluster-marginal loss during the second third and prefix-token loss disabled
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2353,9 +2370,12 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     if step == semantic_snapshot_step:
-        model.semantic_neighbor_table.copy_(
-            build_semantic_neighbor_table(model.lm_head.weight, model.vocab_size)
-        )
+        if master_process:
+            semantic_cluster_table = build_semantic_cluster_table(model.lm_head.weight, model.vocab_size)
+        else:
+            semantic_cluster_table = torch.empty_like(model.semantic_cluster_table)
+        dist.broadcast(semantic_cluster_table, 0)
+        model.semantic_cluster_table.copy_(semantic_cluster_table)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
