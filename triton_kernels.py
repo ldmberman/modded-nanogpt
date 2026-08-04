@@ -905,7 +905,7 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
-SEMANTIC_NEIGHBOR_K = 4
+SEMANTIC_NEIGHBOR_K = 8
 
 CE_KERNEL_DECLS = f"""
 constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};

@@ -1197,7 +1197,7 @@ def build_prefix_table(vocab_size: int) -> Tensor:
         stack_ids.append(tid)
     return torch.tensor(table, dtype=torch.int64)
 
-ENABLE_PREFIX_TOKEN_LOSS = False
+ENABLE_PREFIX_TOKEN_LOSS = True
 SEMANTIC_AUX_MODE = "neighbors"  # "neighbors", "clusters", or "none"
 SEMANTIC_AUX_WEIGHT = 0.1
 SEMANTIC_CLUSTER_COUNT = 256
@@ -2000,7 +2000,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Optional semantic neighbor or cluster snapshot at 1/3, held through the second third and faded out in the final third
+        8. Optional semantic neighbor or cluster snapshot at 1/3, active during the second third
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2064,9 +2064,7 @@ TRAINING_STAGES = [
                   semantic_weight_start=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0,
                   semantic_weight_end=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0,
-                  semantic_weight_start=SEMANTIC_AUX_WEIGHT if SEMANTIC_AUX_MODE != "none" else 0.0,
-                  semantic_weight_end=0.0),
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
     # extension stage
     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weight_start=0.0, prefix_weight_end=0.0),
