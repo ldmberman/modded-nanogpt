@@ -1199,8 +1199,8 @@ def build_prefix_table(vocab_size: int) -> Tensor:
 
 ENABLE_PREFIX_TOKEN_LOSS = True
 SEMANTIC_AUX_MODE = "neighbors"  # "neighbors", "clusters", or "none"
-SEMANTIC_AUX_WEIGHT = 0.1
-SEMANTIC_SNAPSHOT_FRACTION = 1/8
+SEMANTIC_AUX_WEIGHT = 0.125
+SEMANTIC_SNAPSHOT_FRACTION = 1/6
 SEMANTIC_DECAY_END_FRACTION = 2/3
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
@@ -2000,7 +2000,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Optional semantic neighbor or cluster snapshot at 1/8, decayed to zero by 2/3
+        8. Optional semantic neighbor or cluster snapshot at 1/6, decayed to zero by 2/3
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2405,6 +2405,7 @@ if ENABLE_PREFIX_TOKEN_LOSS:
 # begin training
 train_steps = training_schedule.total_steps
 semantic_snapshot_step = training_schedule.semantic_snapshot_step
+tail_probe_steps = set(range(training_schedule.scheduled_iterations, train_steps, 5))
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -2423,8 +2424,10 @@ for step in range(train_steps + 1):
         dist.broadcast(semantic_cluster_table, 0)
         model.semantic_cluster_table.copy_(semantic_cluster_table)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step:
+    if last_step or step in tail_probe_steps or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        use_final_ws = last_step or step in tail_probe_steps
+        training_ws_long = training_manager.ws_long
+        if use_final_ws:
             training_manager.apply_final_ws_ext()
         # stop the clock
         torch.cuda.synchronize()
@@ -2441,8 +2444,10 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms final_ws:{int(use_final_ws)}", console=True)
         model.train()
+        if not last_step:
+            training_manager.ws_long = training_ws_long
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
