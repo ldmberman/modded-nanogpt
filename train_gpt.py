@@ -1199,7 +1199,7 @@ def build_prefix_table(vocab_size: int) -> Tensor:
 
 ENABLE_PREFIX_TOKEN_LOSS = True
 SEMANTIC_AUX_MODE = "cosine"  # "cosine", "neighbors", "clusters", or "none"
-SEMANTIC_AUX_WEIGHT = 0.1
+SEMANTIC_AUX_WEIGHT = 0.025
 SEMANTIC_SNAPSHOT_FRACTION = 1/6
 SEMANTIC_DECAY_END_FRACTION = 2/3
 SEMANTIC_CLUSTER_COUNT = 256
