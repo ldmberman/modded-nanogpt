@@ -1200,7 +1200,7 @@ def build_prefix_table(vocab_size: int) -> Tensor:
 ENABLE_PREFIX_TOKEN_LOSS = True
 SEMANTIC_AUX_MODE = "neighbors"  # "neighbors", "clusters", or "none"
 SEMANTIC_AUX_WEIGHT = 0.1
-SEMANTIC_SNAPSHOT_FRACTION = 1/6
+SEMANTIC_SNAPSHOT_FRACTION = 1/8
 SEMANTIC_DECAY_END_FRACTION = 2/3
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
@@ -2000,7 +2000,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Optional semantic neighbor or cluster snapshot at 1/6, decayed to zero by 2/3
+        8. Optional semantic neighbor or cluster snapshot at 1/8, decayed to zero by 2/3
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
