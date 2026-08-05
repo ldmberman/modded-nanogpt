@@ -1198,13 +1198,13 @@ def build_prefix_table(vocab_size: int) -> Tensor:
     return torch.tensor(table, dtype=torch.int64)
 
 ENABLE_PREFIX_TOKEN_LOSS = True
-SEMANTIC_AUX_MODE = "neighbors"  # "neighbors", "clusters", or "none"
+SEMANTIC_AUX_MODE = "cosine"  # "cosine", "neighbors", "clusters", or "none"
 SEMANTIC_AUX_WEIGHT = 0.05
 SEMANTIC_SNAPSHOT_FRACTION = 1/6
 SEMANTIC_DECAY_END_FRACTION = 2/3
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
-assert SEMANTIC_AUX_MODE in {"neighbors", "clusters", "none"}
+assert SEMANTIC_AUX_MODE in {"cosine", "neighbors", "clusters", "none"}
 
 @torch.no_grad()
 def build_semantic_neighbor_table(lm_head_weight: Tensor, vocab_size: int, chunk_size: int = 1024) -> Tensor:
@@ -1262,6 +1262,7 @@ class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     prefix_weight: torch.Tensor
     semantic_weight: torch.Tensor
+    cosine_loss_active: bool
     ws_short: int
     ws_long: int
     train_max_seq_len: int
@@ -1561,6 +1562,7 @@ class GPT(nn.Module):
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         prefix_weight = schedule_cfg.prefix_weight
         semantic_weight = schedule_cfg.semantic_weight
+        cosine_loss_active = schedule_cfg.cosine_loss_active
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1757,7 +1759,13 @@ class GPT(nn.Module):
         if self.training:
             prefix_target_seq = self.prefix_table[target_seq]
             semantic_neighbor_targets = self.semantic_neighbor_table[target_seq]
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_neighbor_targets, self.semantic_cluster_table, semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            fused_semantic_weight = semantic_weight if SEMANTIC_AUX_MODE in {"neighbors", "clusters"} else None
+            x_flat = x.view(-1, x.size(-1))
+            loss_per_token = FusedSoftcappedCrossEntropy.apply(x_flat, target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_neighbor_targets, self.semantic_cluster_table, fused_semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+            if cosine_loss_active:
+                target_embeddings = F.embedding(target_seq, self.lm_head.weight.T.detach())
+                cosine_loss = 1 - F.cosine_similarity(x_flat.float(), target_embeddings.float(), dim=-1)
+                loss_per_token = loss_per_token + semantic_weight * cosine_loss
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -2000,7 +2008,7 @@ class TrainingSchedule:
         5. Batch size schedule of 8 -> 16 -> 24
         6. Post training extension of long windows from 13 to 20
         7. Seq len updates from 896 to 2048 at 1/3 of training
-        8. Optional semantic neighbor or cluster snapshot at 1/6, decayed to zero by 2/3
+        8. Optional semantic auxiliary loss from 1/6, decayed to zero by 2/3
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
@@ -2022,7 +2030,7 @@ class TrainingSchedule:
         self.split_step = self.boundaries[split_embed_stage][0] | 1
 
         self.semantic_snapshot_step = round(SEMANTIC_SNAPSHOT_FRACTION * scheduled_iterations)
-        semantic_decay_end_step = round(SEMANTIC_DECAY_END_FRACTION * scheduled_iterations)
+        self.semantic_decay_end_step = round(SEMANTIC_DECAY_END_FRACTION * scheduled_iterations)
 
         # Precompute auxiliary loss weights for all steps
         self.mtp_weights = []
@@ -2034,10 +2042,10 @@ class TrainingSchedule:
             self.mtp_weights.append(torch.tensor(w, device=device))
             pw = stage.prefix_weight_start + (stage.prefix_weight_end - stage.prefix_weight_start) * t
             self.prefix_weights.append(torch.tensor([pw], device=device))
-            if SEMANTIC_AUX_MODE == "none" or not self.semantic_snapshot_step <= step < semantic_decay_end_step:
+            if SEMANTIC_AUX_MODE == "none" or not self.semantic_snapshot_step <= step < self.semantic_decay_end_step:
                 sw = 0.0
             else:
-                progress = (step - self.semantic_snapshot_step) / (semantic_decay_end_step - self.semantic_snapshot_step)
+                progress = (step - self.semantic_snapshot_step) / (self.semantic_decay_end_step - self.semantic_snapshot_step)
                 sw = SEMANTIC_AUX_WEIGHT * (1 - progress)
             self.semantic_weights.append(torch.tensor([sw], device=device))
 
@@ -2184,6 +2192,7 @@ class TrainingManager():
             mtp_weights = self.mtp_weights,
             prefix_weight = self.prefix_weight,
             semantic_weight = self.semantic_weight,
+            cosine_loss_active = self.cosine_loss_active,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
             train_max_seq_len = self.train_max_seq_len
@@ -2216,6 +2225,10 @@ class TrainingManager():
         self.mtp_weights = training_schedule.mtp_weights[step]
         self.prefix_weight = training_schedule.prefix_weights[step]
         self.semantic_weight = training_schedule.semantic_weights[step]
+        self.cosine_loss_active = (
+            SEMANTIC_AUX_MODE == "cosine"
+            and training_schedule.semantic_snapshot_step <= step < training_schedule.semantic_decay_end_step
+        )
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
