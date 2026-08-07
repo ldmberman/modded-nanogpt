@@ -1199,7 +1199,7 @@ def build_prefix_table(vocab_size: int) -> Tensor:
 
 ENABLE_PREFIX_TOKEN_LOSS = True
 SEMANTIC_AUX_MODE = "cosine"  # "cosine", "neighbors", "clusters", or "none"
-SEMANTIC_AUX_WEIGHT = 0.025
+SEMANTIC_AUX_WEIGHT = 0.05
 SEMANTIC_SNAPSHOT_FRACTION = 1/6
 SEMANTIC_DECAY_END_FRACTION = 2/3
 SEMANTIC_CLUSTER_COUNT = 256
@@ -1969,7 +1969,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1270  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 5  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
@@ -2418,7 +2418,7 @@ if ENABLE_PREFIX_TOKEN_LOSS:
 # begin training
 train_steps = training_schedule.total_steps
 semantic_snapshot_step = training_schedule.semantic_snapshot_step
-tail_probe_steps = set(range(training_schedule.scheduled_iterations, train_steps, 5))
+tail_probe_steps = set(range(training_schedule.scheduled_iterations - 20, train_steps))
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
