@@ -1202,7 +1202,9 @@ SEMANTIC_AUX_MODE = "cosine"  # "cosine", "neighbors", "clusters", or "none"
 SEMANTIC_AUX_WEIGHT = 0.05
 SEMANTIC_SNAPSHOT_FRACTION = 1/6
 SEMANTIC_DECAY_END_FRACTION = 2/3
-COSINE_TARGET_MODE = "frequency_permuted"  # "target", "rank_permuted", or "frequency_permuted"
+COSINE_TARGET_MODE = "target"  # "target", "global_permuted", "rank_permuted", or "frequency_permuted"
+COSINE_TARGET_EMBEDDING_MODE = "online"  # "online" or "frozen"
+COSINE_CONTEXT_TOKENS = 3
 COSINE_PERMUTATION_BIN_SIZE = 256
 COSINE_FREQUENCY_PERMUTATION_PATH = Path(
     os.environ.get(
@@ -1213,7 +1215,17 @@ COSINE_FREQUENCY_PERMUTATION_PATH = Path(
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
 assert SEMANTIC_AUX_MODE in {"cosine", "neighbors", "clusters", "none"}
-assert COSINE_TARGET_MODE in {"target", "rank_permuted", "frequency_permuted"}
+assert COSINE_TARGET_MODE in {"target", "global_permuted", "rank_permuted", "frequency_permuted"}
+assert COSINE_TARGET_EMBEDDING_MODE in {"online", "frozen"}
+assert COSINE_CONTEXT_TOKENS >= 1
+
+def build_global_cosine_permutation(vocab_size: int, valid_vocab_size: int) -> Tensor:
+    table = torch.arange(vocab_size, dtype=torch.int64)
+    generator = torch.Generator()
+    generator.manual_seed(1234)
+    shuffled = torch.randperm(valid_vocab_size, generator=generator)
+    table[shuffled] = shuffled.roll(1)
+    return table
 
 def build_rank_matched_cosine_permutation(vocab_size: int, valid_vocab_size: int) -> Tensor:
     table = torch.arange(vocab_size, dtype=torch.int64)
@@ -1248,9 +1260,36 @@ def load_frequency_matched_cosine_permutation(vocab_size: int, valid_vocab_size:
 def build_cosine_target_permutation(vocab_size: int, valid_vocab_size: int) -> Tensor:
     if COSINE_TARGET_MODE == "frequency_permuted":
         return load_frequency_matched_cosine_permutation(vocab_size, valid_vocab_size)
+    if COSINE_TARGET_MODE == "global_permuted":
+        return build_global_cosine_permutation(vocab_size, valid_vocab_size)
     if COSINE_TARGET_MODE == "rank_permuted":
         return build_rank_matched_cosine_permutation(vocab_size, valid_vocab_size)
     return torch.arange(vocab_size, dtype=torch.int64)
+
+def build_cosine_context_target(
+    target_seq: Tensor,
+    embedding_table: Tensor,
+    target_permutation: Tensor,
+) -> Tensor:
+    n_rows = target_seq.numel()
+    target_ids = target_permutation[target_seq] if COSINE_TARGET_MODE != "target" else target_seq
+    context_sum = F.normalize(F.embedding(target_ids, embedding_table).float(), dim=-1)
+    context_count = context_sum.new_ones((n_rows, 1))
+
+    for offset in range(1, COSINE_CONTEXT_TOKENS):
+        n_valid = n_rows - offset
+        future_ids = target_seq[offset:]
+        mapped_ids = target_permutation[future_ids] if COSINE_TARGET_MODE != "target" else future_ids
+        future_embeddings = F.normalize(F.embedding(mapped_ids, embedding_table).float(), dim=-1)
+
+        valid = torch.ones(n_valid, dtype=torch.bool, device=target_seq.device)
+        for boundary_offset in range(offset + 1):
+            valid = valid & target_seq[boundary_offset:boundary_offset + n_valid].ne(BOS_ID)
+
+        context_sum = context_sum + F.pad(future_embeddings * valid[:, None], (0, 0, 0, offset))
+        context_count = context_count + F.pad(valid[:, None].to(context_sum.dtype), (0, 0, 0, offset))
+
+    return context_sum / context_count
 
 @torch.no_grad()
 def build_semantic_neighbor_table(lm_head_weight: Tensor, vocab_size: int, chunk_size: int = 1024) -> Tensor:
@@ -1347,6 +1386,14 @@ class GPT(nn.Module):
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
+        self.register_buffer(
+            "cosine_target_embeddings",
+            torch.empty(
+                (self.vocab_size, model_dim) if COSINE_TARGET_EMBEDDING_MODE == "frozen" else 0,
+                dtype=self.lm_head.weight.dtype,
+            ),
+            persistent=False,
+        )
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
         with torch.no_grad():
@@ -1814,9 +1861,13 @@ class GPT(nn.Module):
             x_flat = x.view(-1, x.size(-1))
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x_flat, target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_neighbor_targets, self.semantic_cluster_table, fused_semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
             if cosine_loss_active:
-                cosine_target_seq = self.cosine_target_permutation[target_seq] if COSINE_TARGET_MODE != "target" else target_seq
-                target_embeddings = F.embedding(cosine_target_seq, self.lm_head.weight.T.detach())
-                cosine_loss = 1 - F.cosine_similarity(x_flat.float(), target_embeddings.float(), dim=-1)
+                target_embedding_table = self.cosine_target_embeddings if COSINE_TARGET_EMBEDDING_MODE == "frozen" else self.lm_head.weight.T.detach()
+                context_target = build_cosine_context_target(
+                    target_seq,
+                    target_embedding_table,
+                    self.cosine_target_permutation,
+                )
+                cosine_loss = 1 - F.cosine_similarity(x_flat.float(), context_target, dim=-1)
                 loss_per_token = loss_per_token + semantic_weight * cosine_loss
         else:
             logits = self.lm_head(x)
@@ -2488,6 +2539,8 @@ for step in range(train_steps + 1):
             semantic_cluster_table = torch.empty_like(model.semantic_cluster_table)
         dist.broadcast(semantic_cluster_table, 0)
         model.semantic_cluster_table.copy_(semantic_cluster_table)
+    elif step == semantic_snapshot_step and SEMANTIC_AUX_MODE == "cosine" and COSINE_TARGET_EMBEDDING_MODE == "frozen":
+        model.cosine_target_embeddings.copy_(model.lm_head.weight.T.detach())
     # --------------- VALIDATION SECTION -----------------
     if last_step or step in tail_probe_steps or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         use_final_ws = last_step or step in tail_probe_steps
