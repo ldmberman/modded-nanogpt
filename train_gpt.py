@@ -1202,9 +1202,55 @@ SEMANTIC_AUX_MODE = "cosine"  # "cosine", "neighbors", "clusters", or "none"
 SEMANTIC_AUX_WEIGHT = 0.05
 SEMANTIC_SNAPSHOT_FRACTION = 1/6
 SEMANTIC_DECAY_END_FRACTION = 2/3
+COSINE_TARGET_MODE = "frequency_permuted"  # "target", "rank_permuted", or "frequency_permuted"
+COSINE_PERMUTATION_BIN_SIZE = 256
+COSINE_FREQUENCY_PERMUTATION_PATH = Path(
+    os.environ.get(
+        "COSINE_FREQUENCY_PERMUTATION_PATH",
+        os.path.join(os.environ.get("DATA_PATH", "."), "data/fineweb10B/cosine_frequency_permutation.npz"),
+    )
+)
 SEMANTIC_CLUSTER_COUNT = 256
 SEMANTIC_KMEANS_ITERATIONS = 8
 assert SEMANTIC_AUX_MODE in {"cosine", "neighbors", "clusters", "none"}
+assert COSINE_TARGET_MODE in {"target", "rank_permuted", "frequency_permuted"}
+
+def build_rank_matched_cosine_permutation(vocab_size: int, valid_vocab_size: int) -> Tensor:
+    table = torch.arange(vocab_size, dtype=torch.int64)
+    generator = torch.Generator()
+    generator.manual_seed(1234)
+    for start in range(0, valid_vocab_size, COSINE_PERMUTATION_BIN_SIZE):
+        end = min(start + COSINE_PERMUTATION_BIN_SIZE, valid_vocab_size)
+        shuffled = torch.arange(start, end)[torch.randperm(end - start, generator=generator)]
+        table[shuffled] = shuffled.roll(1)
+    return table
+
+def load_frequency_matched_cosine_permutation(vocab_size: int, valid_vocab_size: int) -> Tensor:
+    if not COSINE_FREQUENCY_PERMUTATION_PATH.is_file():
+        raise FileNotFoundError(
+            f"Frequency permutation not found: {COSINE_FREQUENCY_PERMUTATION_PATH}. "
+            "Run data/build_frequency_permutation.py first."
+        )
+    with np.load(COSINE_FREQUENCY_PERMUTATION_PATH, allow_pickle=False) as artifact:
+        permutation = artifact["permutation"].astype(np.int64, copy=True)
+
+    valid_ids = np.arange(valid_vocab_size, dtype=np.int64)
+    if permutation.shape != (vocab_size,):
+        raise ValueError(f"Expected permutation shape {(vocab_size,)}, got {permutation.shape}")
+    if not np.array_equal(np.sort(permutation[:valid_vocab_size]), valid_ids):
+        raise ValueError("Frequency permutation does not cover each valid token exactly once")
+    if np.any(permutation[:valid_vocab_size] == valid_ids):
+        raise ValueError("Frequency permutation contains fixed points")
+    if not np.array_equal(permutation[valid_vocab_size:], np.arange(valid_vocab_size, vocab_size)):
+        raise ValueError("Frequency permutation must leave padded token IDs unchanged")
+    return torch.from_numpy(permutation)
+
+def build_cosine_target_permutation(vocab_size: int, valid_vocab_size: int) -> Tensor:
+    if COSINE_TARGET_MODE == "frequency_permuted":
+        return load_frequency_matched_cosine_permutation(vocab_size, valid_vocab_size)
+    if COSINE_TARGET_MODE == "rank_permuted":
+        return build_rank_matched_cosine_permutation(vocab_size, valid_vocab_size)
+    return torch.arange(vocab_size, dtype=torch.int64)
 
 @torch.no_grad()
 def build_semantic_neighbor_table(lm_head_weight: Tensor, vocab_size: int, chunk_size: int = 1024) -> Tensor:
@@ -1289,6 +1335,11 @@ class GPT(nn.Module):
         self.register_buffer(
             "semantic_cluster_table",
             torch.full((self.vocab_size,), -1, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cosine_target_permutation",
+            build_cosine_target_permutation(self.vocab_size, vocab_size),
             persistent=False,
         )
 
@@ -1763,7 +1814,8 @@ class GPT(nn.Module):
             x_flat = x.view(-1, x.size(-1))
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x_flat, target_seq, mtp_weights, prefix_target_seq, prefix_weight, semantic_neighbor_targets, self.semantic_cluster_table, fused_semantic_weight, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
             if cosine_loss_active:
-                target_embeddings = F.embedding(target_seq, self.lm_head.weight.T.detach())
+                cosine_target_seq = self.cosine_target_permutation[target_seq] if COSINE_TARGET_MODE != "target" else target_seq
+                target_embeddings = F.embedding(cosine_target_seq, self.lm_head.weight.T.detach())
                 cosine_loss = 1 - F.cosine_similarity(x_flat.float(), target_embeddings.float(), dim=-1)
                 loss_per_token = loss_per_token + semantic_weight * cosine_loss
         else:
