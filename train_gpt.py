@@ -175,7 +175,7 @@ polar_express_coeffs = [
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                  split_baddbmm: bool = False):
+                  nesterov_blend_t: torch.Tensor, split_baddbmm: bool = False):
     """
     Fused Nesterov momentum + Polar Express Sign Method.
     Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
@@ -184,12 +184,13 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
     Polar Express: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
 
-    momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
+    momentum_t and nesterov_blend_t are 0-D CPU tensors to avoid triggering graph recompilations.
     """
     # Nesterov momentum (in FP32)
     momentum = momentum_t.to(grad_chunk.dtype)
+    nesterov_blend = nesterov_blend_t.to(grad_chunk.dtype)
     momentum_buffer.lerp_(grad_chunk, 1 - momentum)
-    g = grad_chunk.lerp_(momentum_buffer, momentum)
+    g = grad_chunk.lerp_(momentum_buffer, nesterov_blend)
 
     X = g.bfloat16()
     is_tall = g.size(-2) > g.size(-1)
@@ -367,6 +368,7 @@ class ParamConfig:
     reshape: tuple | None = None
     chunk_size: int | None = None
     momentum: float | None = None
+    nesterov_blend_cap: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
 
@@ -461,6 +463,7 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._nesterov_blend_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -534,6 +537,7 @@ class NorMuonAndAdam:
                 reshape=reshape,
                 chunk_size=chunk_size,
                 momentum=self.normuon_defaults["momentum"],
+                nesterov_blend_cap=self.normuon_defaults["nesterov_blend_cap"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
@@ -874,13 +878,14 @@ class NorMuonAndAdam:
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
         self._momentum_t.fill_(p_cfg.momentum)
+        self._nesterov_blend_t.fill_(min(p_cfg.momentum, p_cfg.nesterov_blend_cap))
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+            grad_chunk, p_state["momentum_buffer"], self._momentum_t, self._nesterov_blend_t,
             split_baddbmm=is_large_matrix,
         )
 
@@ -2071,6 +2076,7 @@ class TrainingManager():
         normuon_defaults = dict(
             lr=0.023,
             momentum=0.95,
+            nesterov_blend_cap=0.9,
             beta2=0.9,
             weight_decay=1.2,
         )
