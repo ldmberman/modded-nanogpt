@@ -174,23 +174,26 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                  nesterov_blend_t: torch.Tensor, split_baddbmm: bool = False):
+def polar_express(grad_chunk: torch.Tensor, grokfast_buffer: torch.Tensor,
+                  momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
+                  grokfast_alpha: float, grokfast_lambda: float, split_baddbmm: bool = False):
     """
-    Fused Nesterov momentum + Polar Express Sign Method.
-    Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
-    orthogonalization, avoiding materialization of the FP32 intermediate between graph breaks.
+    Fused GrokFast amplification, Nesterov momentum, and Polar Express Sign Method.
+    GrokFast and Nesterov run in FP32 before the result is cast to BF16 for Polar Express,
+    avoiding materialization of the FP32 intermediate between graph breaks.
 
     Polar Express: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
 
-    momentum_t and nesterov_blend_t are 0-D CPU tensors to avoid triggering graph recompilations.
+    momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations.
     """
+    grokfast_buffer.lerp_(grad_chunk, 1 - grokfast_alpha)
+    grad_chunk.add_(grokfast_buffer, alpha=grokfast_lambda)
+
     # Nesterov momentum (in FP32)
     momentum = momentum_t.to(grad_chunk.dtype)
-    nesterov_blend = nesterov_blend_t.to(grad_chunk.dtype)
     momentum_buffer.lerp_(grad_chunk, 1 - momentum)
-    g = grad_chunk.lerp_(momentum_buffer, nesterov_blend)
+    g = grad_chunk.lerp_(momentum_buffer, momentum)
 
     X = g.bfloat16()
     is_tall = g.size(-2) > g.size(-1)
@@ -368,7 +371,8 @@ class ParamConfig:
     reshape: tuple | None = None
     chunk_size: int | None = None
     momentum: float | None = None
-    nesterov_blend_cap: float | None = None
+    grokfast_alpha: float | None = None
+    grokfast_lambda: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
 
@@ -392,6 +396,7 @@ class NorMuonAndAdam:
 
     Differences from standard Muon:
     - Newton-Shulz is replaced with Polar Express for the orthogonalization step
+    - GrokFast EMA amplification is applied before Nesterov momentum
     - NorMuon adds a low-rank variance estimator similar to Adafactor. https://arxiv.org/pdf/2510.05491
     - Cautious weight decay, a gated version of decoupled weight decay
     - Mantissa tracking for precision
@@ -463,7 +468,6 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._nesterov_blend_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -537,7 +541,8 @@ class NorMuonAndAdam:
                 reshape=reshape,
                 chunk_size=chunk_size,
                 momentum=self.normuon_defaults["momentum"],
-                nesterov_blend_cap=self.normuon_defaults["nesterov_blend_cap"],
+                grokfast_alpha=self.normuon_defaults["grokfast_alpha"],
+                grokfast_lambda=self.normuon_defaults["grokfast_lambda"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
@@ -565,6 +570,7 @@ class NorMuonAndAdam:
                 momentum_buffer = torch.zeros(
                     chunk_shape, dtype=torch.float32, device=param.device
                 )
+                grokfast_buffer = torch.zeros_like(momentum_buffer)
 
                 # Second momentum buffer - reduced along one dimension
                 if chunk_shape[-2] >= chunk_shape[-1]:
@@ -582,6 +588,7 @@ class NorMuonAndAdam:
 
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
+                    grokfast_buffer=grokfast_buffer,
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
                 )
@@ -655,6 +662,7 @@ class NorMuonAndAdam:
             if p_cfg.optim == "normuon":
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
+                p_state["grokfast_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
 
@@ -878,14 +886,14 @@ class NorMuonAndAdam:
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
         self._momentum_t.fill_(p_cfg.momentum)
-        self._nesterov_blend_t.fill_(min(p_cfg.momentum, p_cfg.nesterov_blend_cap))
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t, self._nesterov_blend_t,
+            grad_chunk, p_state["grokfast_buffer"], p_state["momentum_buffer"], self._momentum_t,
+            p_cfg.grokfast_alpha, p_cfg.grokfast_lambda,
             split_baddbmm=is_large_matrix,
         )
 
@@ -1884,6 +1892,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
 @dataclass(slots=True)
 class Hyperparameters:
+    seed: int = int(os.environ.get("RUN_SEED", "1337"))
     # data
     data_path = os.environ.get("DATA_PATH", ".")
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
@@ -1901,6 +1910,8 @@ class Hyperparameters:
     #   - (1 + m_r9) * x self-reference fuse on layer 9
     #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    late_val_loss_start: int = 1250
+    late_val_loss_every: int = 5
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
@@ -1909,6 +1920,8 @@ class Hyperparameters:
     bigram_sign_table_rows: int = 8192  # prefer a power of 2 (values ~500-15000 gave similar results)
 
 args = Hyperparameters()
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -2076,7 +2089,8 @@ class TrainingManager():
         normuon_defaults = dict(
             lr=0.023,
             momentum=0.95,
-            nesterov_blend_cap=0.9,
+            grokfast_alpha=0.98,
+            grokfast_lambda=2.0,
             beta2=0.9,
             weight_decay=1.2,
         )
@@ -2230,6 +2244,7 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"Run seed {args.seed}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2327,7 +2342,13 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    regular_val_step = args.val_loss_every > 0 and step % args.val_loss_every == 0
+    late_val_step = (
+        args.late_val_loss_every > 0
+        and step >= args.late_val_loss_start
+        and step % args.late_val_loss_every == 0
+    )
+    if last_step or regular_val_step or late_val_step:
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
