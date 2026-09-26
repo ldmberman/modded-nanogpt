@@ -571,13 +571,10 @@ def quantize_transpose_mlp_down_weights_kernel(
         tl.store(row_output_ptr + row_offsets, quantized.to(tl.float8e4nv), mask=mask)
 
 
-_dummy_f32 = None  # lazily initialized 1-element tensor for unused pointer args
-
 def _get_dummy_f32(device):
-    global _dummy_f32
-    if _dummy_f32 is None or _dummy_f32.device != device:
-        _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
-    return _dummy_f32
+    # A fresh 1-element tensor. A cached global is a mutation dynamo rejects
+    # once this call sits inside a compiled forward.
+    return torch.zeros(1, dtype=torch.float32, device=device)
 
 def linear_relu_square(
     a,

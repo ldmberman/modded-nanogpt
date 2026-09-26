@@ -535,16 +535,27 @@ class NorMuonAndAdam:
             shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
             lr_mul = shape_mult * lr_mul
 
-            # Per-matrix LR multipliers for MLP c_proj (2x LR on odd indices)
+            # Per-matrix LR multipliers. The down projection gets 2x LR.
+            # Squared ReLU stores (c_fc, c_proj) so the down proj is the odd index.
+            # SwiGLU stores (gate, up, down). Its matrices are 2048 wide, so the
+            # shape term in lr_mul is smaller; the multipliers below put the
+            # effective LRs back on the 3072-wide squared-ReLU values.
             per_matrix_lr_mul = None
             if label == "mlp_bank":
+                swiglu = os.environ.get("SWIGLU", "0") == "1"
+                n_mat = 3 if swiglu else 2
+                other_mul, down_mul = 1.0, 2.0
+                if swiglu:
+                    shape_now = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5
+                    other_mul = 2.0 / shape_now
+                    down_mul = 4.0 / shape_now
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 start_idx = rank * chunk_size
                 per_matrix_lr_mul = []
                 for i in range(chunk_size):
                     global_idx = start_idx + i
-                    is_c_proj = (global_idx % 2 == 1)
-                    per_matrix_lr_mul.append(2.0 if is_c_proj else 1.0)
+                    is_down = (global_idx % n_mat) == (n_mat - 1)
+                    per_matrix_lr_mul.append(down_mul if is_down else other_mul)
 
             p_cfg = ParamConfig(
                 label=label,
@@ -1540,18 +1551,25 @@ class GPT(nn.Module):
         )
 
     def init_mlp(self, model_dim):
-        # MLP bank: stores c_fc and c_proj for all MLP layers
-        # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        self.mlp_hdim = 4 * model_dim
-        self.mlp_bank = nn.Parameter(torch.empty(12, 2, self.mlp_hdim, model_dim))  # (12, 2, 3072, 768)
-        self.mlp_bank.reshape = (24, self.mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
+        # MLP bank. Squared ReLU stores (c_fc, c_proj) at width 4 * model_dim.
+        # SWIGLU=1 stores (gate, up, down) at width 8/3 * model_dim, which is the
+        # same parameter count. One padding layer keeps the bank length even.
+        self.swiglu = os.environ.get("SWIGLU", "0") == "1"
+        n_mat = 3 if self.swiglu else 2
+        self.mlp_hdim = (8 * model_dim // 3) if self.swiglu else 4 * model_dim
+        self.mlp_bank = nn.Parameter(torch.empty(12, n_mat, self.mlp_hdim, model_dim))
+        self.mlp_bank.reshape = (12 * n_mat, self.mlp_hdim, model_dim)
 
         # improved init scale by @YouJiacheng and @srashedll
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         with torch.no_grad():
-            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
-            self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)
+            if self.swiglu:
+                self.mlp_bank[:, 1, :, :].uniform_(-bound, bound)  # up
+                self.mlp_bank[:, 2, :, :].zero_()  # down
+            else:
+                self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
         # Lagged activation scales for the FP8 MLP. `post` is the forward activation
         # relu(pre)^2; `dpre` is its gradient. Both are scaled from the previous step's
@@ -1710,7 +1728,7 @@ class GPT(nn.Module):
         The down projection uses an exact-current scale; its two layouts still come
         from a single read of the weights.
         """
-        if not self.use_fp8:
+        if not self.use_fp8 or self.swiglu:
             return
         with torch.no_grad():
             if update_activation_scales:
@@ -1836,7 +1854,7 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        use_mlp_fp8 = self.training and self.use_fp8
+        use_mlp_fp8 = self.training and self.use_fp8 and not self.swiglu
         use_attn_fp8 = self.training and self.use_fp8
         if use_attn_fp8:
             attn_qkv_f8 = self._attn_qkv_f8.unbind(0)
@@ -1887,9 +1905,14 @@ class GPT(nn.Module):
         vo_all = self.vo_bank[:self._num_attn_layers * 2].unbind(0)
         v_per_layer = vo_all[0::2]
         o_per_layer = vo_all[1::2]
-        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
-        mlp_fcs = mlp_all[0::2]    # even indices: c_fc
-        mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)
+        if self.swiglu:
+            mlp_gates = mlp_all[0::3]
+            mlp_ups = mlp_all[1::3]
+            mlp_downs = mlp_all[2::3]
+        else:
+            mlp_fcs = mlp_all[0::2]    # even indices: c_fc
+            mlp_projs = mlp_all[1::2]  # odd indices: c_proj
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1934,8 +1957,13 @@ class GPT(nn.Module):
             is_paired = i in self.paired_head_layers
             yarn = self.yarn_paired_head if is_paired else self.yarn
             attn = self.attn_paired if is_paired else self.attn
-            c_fc = mlp_fcs[i]
-            c_proj = mlp_projs[i]
+            if self.swiglu:
+                w_gate = mlp_gates[i]
+                w_up = mlp_ups[i]
+                w_down = mlp_downs[i]
+            else:
+                c_fc = mlp_fcs[i]
+                c_proj = mlp_projs[i]
             if use_mlp_fp8:
                 up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
                 up_proj_f8_t = mlp_up_proj_f8_t[i]
