@@ -1,0 +1,1 @@
+TRAIN_SEED=0 NUM_EXTENSION_ITERATIONS=160 VAL_PROBE_EVERY=5 .venv/bin/torchrun --standalone --nproc_per_node=1 train_gpt.py
